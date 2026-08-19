@@ -1982,7 +1982,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 					material.Roughness = material.Roughness;
 #			else
 					material.F0 = 1.0;
-					material.Roughness = 1.0 / 7.0;
+					material.Roughness = 1.0 / 8.0;
 #			endif
 				}
 
