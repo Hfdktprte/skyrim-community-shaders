@@ -25,7 +25,7 @@ public:
 	struct Settings
 	{
 		bool Enabled = true;
-		int32_t Quality = 1;  // QualityDensities index
+		int32_t Quality = 2;  // QualityDensities index
 
 		// Blade shape and material
 		float grassHeight = 100.0f;
@@ -34,17 +34,17 @@ public:
 		float tipWeight = 0.54f;
 		float mid = 0.73f;
 		float rotationalStiffness = 1.0f;
-		float ao = 0.15f;  // Minimum blade AO
-		float specular = 0.15f;
+		float ao = 0.10f;  // Minimum blade AO
+		float specular = 0.20f;
 		float2 subsurfaceOpacity = float2(0.8f, 0.10f);  // Base to tip
-		float3 grassSubsurfaceTint = float3(0.15f, 0.14f, 0.04f);  // Backlight tint
-		float3 baseMinTipRoughness = float3(0.85f, 0.55f, 0.75f);
+		float3 grassSubsurfaceTint = float3(1.50f, 1.00f, 0.60f);  // Backlight tint
+		float3 baseMinTipRoughness = float3(0.65f, 0.45f, 0.55f);
 		float tipRoughnessStart = 0.75f;
 		float clumpAOStrength = 0.5f;
 
 		// Colour
-		float3 baseColor = float3(0.072f, 0.057f, 0.027f);
-		float3 tipColor = float3(0.157f, 0.105f, 0.044f);
+		float3 baseColor = float3(0.193f, 0.141f, 0.069f);
+		float3 tipColor = float3(0.221f, 0.241f, 0.147f);
 		float grassColorHueVariation = 0.60f;                   // Per-blade hue variation
 		float grassColorValueVariation = 0.40f;                 // Per-blade brightness variation
 		float grassColorTipDryStrength = 0.35f;                 // Tip dry-tint strength
@@ -58,14 +58,14 @@ public:
 		float grassClumpColorStrength = 0.6f;
 		float grassMicroDetail = 0.5f;
 		float grassAmbientFlatten = 0.7f;
-		float grassCanopySkyOcclusion = 0.3f;
+		float grassCanopySkyOcclusion = 0.0f;
 		float grassDensityAO = 0.2f;
 		float grassWrap = 1.0f;
 		float grassAniso = 0.15f;
 		float grassBounceStrength = 0.35f;
 		float3 grassBounceColor = float3(0.55f, 0.42f, 0.24f);
-		float grassSunSelfShadow = 0.3f;
-		float grassSpecOcclusion = 0.7f;
+		float grassSunSelfShadow = 0.0f;
+		float grassSpecOcclusion = 0.0f;
 		float grassAmbientDesat = 0.5f;
 
 		// Surface texture
@@ -76,14 +76,14 @@ public:
 
 		// Per-type vein detail
 		float3 grassVeinTint = float3(0.70f, 0.80f, 0.66f);  // albedo tint in the vein grooves
-		float grassVeinAlbedoStrength = 0.32f;               // how strongly the tint applies
-		float grassVeinNormalStrength = 0.37f;               // vein normal-tilt amount
+		float grassVeinAlbedoStrength = 0.75f;               // how strongly the tint applies
+		float grassVeinNormalStrength = 0.60f;               // vein normal-tilt amount
 		float grassVeinRippleDepth = 0.28f;                  // along-blade ripple modulation of the veins
-		float grassVeinWiggleAmount = 0.06f;                 // fine micro-wiggle of the surface normal
+		float grassVeinWiggleAmount = 0.09f;                 // fine micro-wiggle of the surface normal
 
 		// Terrain blend and shadow
-		float grassTerrainBlendStrength = 0.9f;
-		float grassTerrainBlendHeight = 4.0f;
+		float grassTerrainBlendStrength = 1.0f;
+		float grassTerrainBlendHeight = 2.0f;
 		float grassTerrainBlendNormal = 0.8f;
 		float grassTerrainBlendRough = 0.7f;
 		float grassAOStrength = 0.6f;   // Terrain darkening. 0 disables it.
@@ -187,6 +187,8 @@ private:
 	std::vector<PGrassCommon::Quadrant> quadrantsFarLOD;
 	std::vector<PGrassCommon::Quadrant> quadrantsPresence;
 
+	bool vanillaToggled = false;
+
 	// Far reads LAND data on workers. Near tiers use loaded cell LAND data.
 	GrassCellCache grassCellCache;
 
@@ -196,6 +198,7 @@ private:
 	ID3D11DepthStencilState* depthEqualDS = nullptr;
 	ID3D11BlendState* depthOnlyBlend = nullptr;
 	ID3D11BlendState* defaultBlend = nullptr;
+	ID3D11BlendState* terrainFadeBlend = nullptr;
 	ID3D11BlendState* multiplyBlend = nullptr;
 	ID3D11DepthStencilState* noDepthDSS = nullptr;
 
@@ -203,7 +206,7 @@ private:
 	Texture2D* grassDensityTexture = nullptr;
 	ID3D11VertexShader* densityAOVS = nullptr;
 	ID3D11PixelShader* densityAOPS = nullptr;
-	/** @brief Dither-discards the blade base in the depth prepass, matching the colour pass's terrain dissolve. */
+	/** @brief Restricts High/Mid depth writes to the fully opaque portion above the terrain fade. */
 	ID3D11PixelShader* depthClipPS = nullptr;
 	static constexpr uint32_t grassDensityDim = 256;
 
@@ -330,7 +333,6 @@ private:
 
 	static void CopyDepthBuffer(ID3D11DeviceContext* ctx, RE::BSGraphics::Renderer* renderer);
 	static void SetViewport(ID3D11DeviceContext* ctx, float2 size);
-	static void ClearRenderTargets(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* rtvs[8]);
 
 	void PostDepthRendering();
 	void GetVisibleQuadrants();
