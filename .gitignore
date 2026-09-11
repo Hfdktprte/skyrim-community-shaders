@@ -12,3 +12,6 @@ shadertoolsconfig.json
 .claude/settings.local.json
 
 tools/__pycache__/
+
+# Proprietary DLSS 5 Neural Rendering runtime; install locally, never commit it.
+**/nvngx_dlssnr.dll

@@ -8,6 +8,8 @@
 #include "State.h"
 #include "Upscaling/DX12SwapChain.h"
 #include "Upscaling/FidelityFX.h"
+#include "Upscaling/NeuralRendering/Integration.h"
+#include "Upscaling/NeuralRendering/Renderer.h"
 #include "Upscaling/Streamline.h"
 #include "Utils/Game.h"
 #include "Utils/UI.h"
@@ -38,7 +40,16 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	reflexLowLatencyBoost,
 	reflexUseMarkersToOptimize,
 	reflexUseFPSLimit,
-	reflexFPSLimit);
+	reflexFPSLimit,
+	neuralRenderingEnabled,
+	neuralRenderingPreset,
+	neuralRenderingIntensity,
+	neuralRenderingLocalTone,
+	neuralRenderingLocalStructure,
+	neuralRenderingSkinStructure,
+	neuralRenderingStyle,
+	neuralRenderingAutoMask,
+	neuralRenderingUICorrection);
 
 decltype(&D3D11CreateDeviceAndSwapChain) ptrD3D11CreateDeviceAndSwapChainUpscaling;
 
@@ -296,6 +307,50 @@ void Upscaling::DrawSettings()
 									  "Set to 'Default' for automatic selection based on your Upscale Preset and hardware.\n"
 									  "Changing this setting requires a restart to take effect."));
 			}
+
+			if (ImGui::CollapsingHeader(T(TKEY("neural_rendering_header"), "DLSS 5 Neural Rendering"), ImGuiTreeNodeFlags_DefaultOpen)) {
+				ImGui::Checkbox(T(TKEY("neural_rendering_enable"), "Enable DLSS 5 Neural Rendering"), &settings.neuralRenderingEnabled);
+				if (globals::features::hdrDisplay.loaded && globals::features::hdrDisplay.settings.enableHDR)
+					Util::Text::Warning("DLSS 5 Neural Rendering currently requires HDR Display to be disabled.");
+				if (settings.neuralRenderingEnabled) {
+					static const char* tuningPresets[] = { "Custom", "Balanced", "Fabric Detail", "Natural", "Strong" };
+					int tuningPreset = static_cast<int>(settings.neuralRenderingPreset);
+					if (ImGui::Combo(T(TKEY("neural_rendering_preset"), "Tuning Preset"), &tuningPreset, tuningPresets, IM_ARRAYSIZE(tuningPresets))) {
+						settings.neuralRenderingPreset = static_cast<uint>(tuningPreset);
+						switch (settings.neuralRenderingPreset) {
+						case 1: settings.neuralRenderingIntensity = 1.0f; settings.neuralRenderingLocalTone = 1.0f; settings.neuralRenderingLocalStructure = 1.0f; settings.neuralRenderingSkinStructure = 1.0f; break;
+						case 2: settings.neuralRenderingIntensity = 1.35f; settings.neuralRenderingLocalTone = 0.9f; settings.neuralRenderingLocalStructure = 1.6f; settings.neuralRenderingSkinStructure = 1.15f; break;
+						case 3: settings.neuralRenderingIntensity = 0.8f; settings.neuralRenderingLocalTone = 0.75f; settings.neuralRenderingLocalStructure = 0.9f; settings.neuralRenderingSkinStructure = 0.9f; break;
+						case 4: settings.neuralRenderingIntensity = 1.75f; settings.neuralRenderingLocalTone = 1.25f; settings.neuralRenderingLocalStructure = 1.5f; settings.neuralRenderingSkinStructure = 1.3f; break;
+						default: break;
+						}
+					}
+					bool custom = false;
+					custom |= ImGui::SliderFloat(T(TKEY("neural_rendering_intensity"), "Intensity"), &settings.neuralRenderingIntensity, 0.0f, 2.0f, "%.2f");
+					custom |= ImGui::SliderFloat(T(TKEY("neural_rendering_local_tone"), "Local Tone"), &settings.neuralRenderingLocalTone, 0.0f, 2.0f, "%.2f");
+					custom |= ImGui::SliderFloat(T(TKEY("neural_rendering_local_structure"), "Local Structure"), &settings.neuralRenderingLocalStructure, 0.0f, 2.0f, "%.2f");
+					custom |= ImGui::SliderFloat(T(TKEY("neural_rendering_skin_structure"), "Skin Structure"), &settings.neuralRenderingSkinStructure, 0.0f, 2.0f, "%.2f");
+					static const char* styles[] = { "Style 0", "Style 1", "Style 2", "Style 3" };
+					int style = static_cast<int>(settings.neuralRenderingStyle);
+					if (ImGui::Combo(T(TKEY("neural_rendering_style"), "Style"), &style, styles, IM_ARRAYSIZE(styles))) {
+						settings.neuralRenderingStyle = static_cast<uint>(style);
+						custom = true;
+					}
+					custom |= ImGui::Checkbox(T(TKEY("neural_rendering_auto_mask"), "Automatic Mask"), &settings.neuralRenderingAutoMask);
+					custom |= ImGui::Checkbox(T(TKEY("neural_rendering_ui_correction"), "UI Correction"), &settings.neuralRenderingUICorrection);
+					if (custom)
+						settings.neuralRenderingPreset = 0;
+					auto& neuralRenderer = NeuralRendering::Renderer::Instance();
+					if (neuralRenderer.IsFailureLatched()) {
+						Util::Text::Warning("DLSS 5 Neural Rendering failed for this session. Check CommunityShaders.log.");
+						if (ImGui::Button("Reset DLSS 5 Failure"))
+							neuralRenderer.Reset();
+					}
+					ImGui::TextDisabled("Status: %s | NGX: 0x%08X | Frames: %llu",
+						neuralRenderer.StatusText(), neuralRenderer.NgxResult(),
+						static_cast<unsigned long long>(neuralRenderer.SuccessfulFrames()));
+				}
+			}
 		}
 	}
 
@@ -510,6 +565,12 @@ void Upscaling::LoadSettings(json& o_json)
 			clampedReflexFPSLimit);
 	}
 	settings.reflexFPSLimit = clampedReflexFPSLimit;
+	settings.neuralRenderingPreset = std::min(settings.neuralRenderingPreset, 4u);
+	settings.neuralRenderingIntensity = std::clamp(settings.neuralRenderingIntensity, 0.0f, 2.0f);
+	settings.neuralRenderingLocalTone = std::clamp(settings.neuralRenderingLocalTone, 0.0f, 2.0f);
+	settings.neuralRenderingLocalStructure = std::clamp(settings.neuralRenderingLocalStructure, 0.0f, 2.0f);
+	settings.neuralRenderingSkinStructure = std::clamp(settings.neuralRenderingSkinStructure, 0.0f, 2.0f);
+	settings.neuralRenderingStyle = std::min(settings.neuralRenderingStyle, 3u);
 	auto iniSettingCollection = globals::game::iniPrefSettingCollection;
 	if (iniSettingCollection) {
 		auto setting = iniSettingCollection->GetSetting("bUseTAA:Display");
@@ -1015,6 +1076,7 @@ void Upscaling::SetupResources()
 
 void Upscaling::ClearShaderCache()
 {
+	NeuralRendering::Renderer::Instance().Reset();
 	for (int i = 0; i < 4; ++i) {
 		encodeTexturesCS[i] = nullptr;  // com_ptr automatically releases
 	}
@@ -1700,6 +1762,11 @@ void Upscaling::Main_PostProcessing::thunk(RE::ImageSpaceManager* a_this, uint32
 	// Restore kFRAMEBUFFER after ISHDR — hdrTexture now has the HDR scene
 	if (hdrLoaded)
 		globals::features::hdrDisplay.RestoreFramebuffer();
+
+	// Run after image-space post processing and before DrawInterfaceStart adds UI.
+	// When frame generation is active, the neural renderer reuses its D3D12 device
+	// and queue; the shared fence chain makes the result visible to the FG present.
+	NeuralRendering::ApplyLdr();
 
 	Util::SetTemporal(false);
 }
