@@ -347,6 +347,7 @@ struct IDXGISwapChain_Present
 			});
 
 		globals::features::screenshotFeature.ProcessCaptureRequest();
+		globals::features::upscaling.dx12SwapChain.ClearWrappedBuffers();
 
 		TracyD3D11Collect(globals::state->tracyCtx);
 
