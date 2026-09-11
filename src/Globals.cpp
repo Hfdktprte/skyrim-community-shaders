@@ -25,6 +25,7 @@
 #include "Features/PhysicalSky.h"
 #include "Features/PostProcessing.h"
 #include "Features/PseudoSunBounce.h"
+#include "Features/ProceduralGrass.h"
 #include "Features/RemoteControl.h"
 #include "Features/RenderDoc.h"
 #include "Features/ScreenSpaceGI.h"
@@ -114,6 +115,7 @@ namespace globals
 		PostProcessing postProcessing{};
 		Skin skin{};
 		PseudoSunBounce pseudoSunBounce{};
+		ProceduralGrass proceduralGrass{};
 
 		namespace llf
 		{

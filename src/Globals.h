@@ -44,9 +44,10 @@ struct Effects11;
 struct ExponentialHeightFog;
 struct HDRDisplay;
 struct PostProcessing;
+struct ProceduralGrass;
+struct ScreenshotFeature;
 struct Skin;
 struct PseudoSunBounce;
-struct ScreenshotFeature;
 
 class State;
 class Deferred;
@@ -146,6 +147,7 @@ namespace globals
 		extern PostProcessing postProcessing;
 		extern Skin skin;
 		extern PseudoSunBounce pseudoSunBounce;
+		extern ProceduralGrass proceduralGrass;
 
 	}
 
