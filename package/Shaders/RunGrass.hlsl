@@ -674,6 +674,16 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float4 specColor = complex ? TexBaseSampler.SampleBias(SampBaseSampler, float2(input.TexCoord.x, 0.5 + input.TexCoord.y * 0.5), SharedData::MipBias) : 1;
 #			endif
 
+#			if defined(VANILLA_FRESNEL)
+	const bool enableVanillaFresnel = SharedData::vanillaFresnelSettings.Enable;
+	float3 grassF0 = enableVanillaFresnel ? max(SharedData::vanillaFresnelSettings.MinF0,
+		saturate(specColor.w * SharedData::grassLightingSettings.SpecularStrength *
+		SharedData::vanillaFresnelSettings.BaseF0Multiplier / Math::PI)) : 0.0;
+#			else
+	float3 grassF0 = 0.0;
+#			endif
+	float grassRoughness = saturate(1.0 - SharedData::grassLightingSettings.Glossiness * 0.01);
+
 	psout.MotionVectors = MotionBlur::GetSSMotionVector(float4(input.WorldPosition, 1), float4(input.PreviousWorldPosition, 1));
 
 	float3 viewDirection = -normalize(input.WorldPosition.xyz);
@@ -784,7 +794,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #			else
 	if (complex)
 #			endif
-		lightsSpecularColor += dirDetailedShadow * GrassLighting::GetLightSpecularInput(SharedData::DirLightDirection.xyz, viewDirection, normal, dirLightColor, SharedData::grassLightingSettings.Glossiness) * Color::VanillaNormalization();
+		lightsSpecularColor += dirDetailedShadow * GrassLighting::GetLightSpecularInput(SharedData::DirLightDirection.xyz, viewDirection, normal, dirLightColor, grassRoughness, grassF0) * Color::VanillaNormalization();
 
 #			if defined(LIGHT_LIMIT_FIX)
 	uint clusterIndex = 0;
@@ -843,7 +853,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #				else
 				if (complex)
 #				endif
-					lightsSpecularColor += GrassLighting::GetLightSpecularInput(normalizedLightDirection, viewDirection, normal, lightColor, SharedData::grassLightingSettings.Glossiness) * Color::VanillaNormalization();
+					lightsSpecularColor += GrassLighting::GetLightSpecularInput(normalizedLightDirection, viewDirection, normal, lightColor, grassRoughness, grassF0) * Color::VanillaNormalization();
 			}
 		}
 	}
