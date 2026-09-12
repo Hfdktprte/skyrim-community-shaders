@@ -4,6 +4,19 @@
 
 namespace Util
 {
+	struct CelestialTransitionRequest
+	{
+		bool timeJump = false;
+		bool gameLoad = false;
+	};
+
+	void SetCelestialTransitionHandlerAvailable(bool a_available);
+	void RequestTimeJumpTransition();
+	void RequestGameLoadTransition();
+	[[nodiscard]] CelestialTransitionRequest ConsumeCelestialTransitionRequest();
+	void CompleteCelestialTransition();
+	[[nodiscard]] std::uint32_t GetCompletedCelestialTransitionGeneration();
+
 	float4 TryGetWaterData(float offsetX, float offsetY);
 	float4 GetCameraData();
 	bool GetTemporal();

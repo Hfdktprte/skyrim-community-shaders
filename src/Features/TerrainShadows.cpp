@@ -350,7 +350,7 @@ bool TerrainShadows::UpdateShadow(bool a_refreshImmediately)
 
 	auto accumulator = *globals::game::currentAccumulator.get();
 	if (!accumulator)
-		return;
+		return false;
 
 	auto shadowSceneNode = accumulator->GetRuntimeData().activeShadowSceneNode;
 	if (!shadowSceneNode)
