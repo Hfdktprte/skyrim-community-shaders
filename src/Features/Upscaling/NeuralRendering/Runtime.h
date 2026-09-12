@@ -12,11 +12,14 @@ namespace NeuralRendering
 {
 	struct Tuning
 	{
-		float intensity = 0.8f;
-		float localToneStrength = 0.75f;
-		float localStructureStrength = 0.9f;
-		float skinStructureStrength = 0.9f;
-		std::uint32_t style = 3;
+		float intensity = 1.0f;
+		float localToneStrength = 1.0f;
+		float localStructureStrength = 1.0f;
+		float globalToneStrength = 1.0f;
+		float skinStructureStrength = 1.0f;
+		float processingScale = 1.0f;
+		std::uint32_t passCount = 1;
+		std::uint32_t style = 0;
 		bool useAutoMask = true;
 		bool uiCorrection = false;
 	};
@@ -54,14 +57,15 @@ namespace NeuralRendering
 		[[nodiscard]] std::uint64_t SuccessfulFrames() const { return successfulFrames_; }
 
 	private:
+		static constexpr std::uint32_t kFeatureSlotCount = 20;
 		Runtime() = default;
 		void* module_ = nullptr;
 		void* parameters_ = nullptr;
-		void* featureHandles_[2]{};
-		std::uint32_t featureInputWidth_[2]{};
-		std::uint32_t featureInputHeight_[2]{};
-		std::uint32_t featureOutputWidth_[2]{};
-		std::uint32_t featureOutputHeight_[2]{};
+		void* featureHandles_[kFeatureSlotCount]{};
+		std::uint32_t featureInputWidth_[kFeatureSlotCount]{};
+		std::uint32_t featureInputHeight_[kFeatureSlotCount]{};
+		std::uint32_t featureOutputWidth_[kFeatureSlotCount]{};
+		std::uint32_t featureOutputHeight_[kFeatureSlotCount]{};
 		ID3D12Device* device_ = nullptr;
 		RuntimeStatus status_ = RuntimeStatus::NotProbed;
 		std::filesystem::path path_;

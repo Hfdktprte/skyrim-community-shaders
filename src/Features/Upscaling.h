@@ -68,12 +68,15 @@ public:
 		bool reflexUseFPSLimit = false;
 		float reflexFPSLimit = 60.0f;
 		bool neuralRenderingEnabled = false;
-		uint neuralRenderingPreset = 3;
-		float neuralRenderingIntensity = 0.8f;
-		float neuralRenderingLocalTone = 0.75f;
-		float neuralRenderingLocalStructure = 0.9f;
-		float neuralRenderingSkinStructure = 0.9f;
-		uint neuralRenderingStyle = 3;
+		uint neuralRenderingPreset = 0;  // Retained for compatibility with older settings files.
+		float neuralRenderingIntensity = 1.0f;
+		float neuralRenderingLocalTone = 1.0f;
+		float neuralRenderingLocalStructure = 1.0f;
+		float neuralRenderingGlobalTone = 1.0f;
+		float neuralRenderingSkinStructure = 1.0f;
+		float neuralRenderingResolutionScale = 100.0f;
+		uint neuralRenderingPassCount = 1;
+		uint neuralRenderingStyle = 0;
 		bool neuralRenderingAutoMask = true;
 		bool neuralRenderingUICorrection = false;
 	};

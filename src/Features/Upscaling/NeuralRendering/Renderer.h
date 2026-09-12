@@ -38,6 +38,7 @@ namespace NeuralRendering
 			ID3D11Resource* color, ID3D11Resource* depth, ID3D11ShaderResourceView* depthSRV,
 			ID3D11Resource* motionVectors,
 			std::uint32_t guideWidth, std::uint32_t guideHeight,
+			std::uint32_t guideContentWidth, std::uint32_t guideContentHeight,
 			std::uint32_t colorWidth, std::uint32_t colorHeight,
 			float motionVectorScaleX, float motionVectorScaleY, const Tuning& tuning,
 			ID3D12Device* sharedDevice = nullptr, ID3D12CommandQueue* sharedQueue = nullptr);

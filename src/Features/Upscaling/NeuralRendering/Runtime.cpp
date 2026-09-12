@@ -288,7 +288,7 @@ namespace NeuralRendering
 		std::uint32_t inputWidth, std::uint32_t inputHeight, std::uint32_t outputWidth, std::uint32_t outputHeight,
 		float motionVectorScaleX, float motionVectorScaleY, const Tuning& tuning, bool reset)
 	{
-		if (status_ != RuntimeStatus::Initialized || !commandList || slot >= 2 || !color || !depth || !motionVectors || !output)
+		if (status_ != RuntimeStatus::Initialized || !commandList || slot >= std::size(featureHandles_) || !color || !depth || !motionVectors || !output)
 			return false;
 		auto* parameters = static_cast<NVSDK_NGX_Parameter*>(parameters_);
 		auto create = reinterpret_cast<CreateFeature>(GetProcAddress(static_cast<HMODULE>(module_), "NVSDK_NGX_D3D12_CreateFeature"));
@@ -366,6 +366,7 @@ namespace NeuralRendering
 		parameters->Set("DLSSNR.Intensity", tuning.intensity);
 		parameters->Set("DLSSNR.LocalToneStrength", tuning.localToneStrength);
 		parameters->Set("DLSSNR.LocalStructureStrength", tuning.localStructureStrength);
+		parameters->Set("DLSSNR.GlobalToneStrength", tuning.globalToneStrength);
 		parameters->Set("DLSSNR.SkinStructureStrength", tuning.skinStructureStrength);
 		parameters->Set("DLSSNR.UseAutoMask", tuning.useAutoMask ? 1u : 0u);
 		parameters->Set("DLSSNR.Style", tuning.style);
@@ -382,7 +383,7 @@ namespace NeuralRendering
 
 	void Runtime::ResetFeature(std::uint32_t slot)
 	{
-		if (!module_ || slot >= 2)
+		if (!module_ || slot >= std::size(featureHandles_))
 			return;
 		SignedRuntimePathScope scope(static_cast<HMODULE>(module_), path_.parent_path() / L"nvngx.dll");
 		auto release = reinterpret_cast<ReleaseFeature>(GetProcAddress(static_cast<HMODULE>(module_), "NVSDK_NGX_D3D12_ReleaseFeature"));
@@ -399,7 +400,7 @@ namespace NeuralRendering
 
 	void Runtime::ResetFeatures()
 	{
-		for (std::uint32_t slot = 0; slot < 2; ++slot)
+		for (std::uint32_t slot = 0; slot < std::size(featureHandles_); ++slot)
 			ResetFeature(slot);
 		successfulFrames_ = 0;
 	}

@@ -63,7 +63,10 @@ namespace NeuralRendering
 				settings.neuralRenderingIntensity,
 				settings.neuralRenderingLocalTone,
 				settings.neuralRenderingLocalStructure,
+				settings.neuralRenderingGlobalTone,
 				settings.neuralRenderingSkinStructure,
+				settings.neuralRenderingResolutionScale * 0.01f,
+				settings.neuralRenderingPassCount,
 				settings.neuralRenderingStyle,
 				settings.neuralRenderingAutoMask,
 				settings.neuralRenderingUICorrection,
@@ -117,6 +120,10 @@ namespace NeuralRendering
 		upscaling.motionVectorCopyTexture->resource->GetDesc(&motionDesc);
 		if (!EnsureColorResource(framebuffer, colorDesc.Width, colorDesc.Height))
 			return false;
+		const auto guideContentWidth = std::clamp(static_cast<std::uint32_t>(
+			std::lround(static_cast<double>(motionDesc.Width) * upscaling.resolutionScale.x)), 1u, motionDesc.Width);
+		const auto guideContentHeight = std::clamp(static_cast<std::uint32_t>(
+			std::lround(static_cast<double>(motionDesc.Height) * upscaling.resolutionScale.y)), 1u, motionDesc.Height);
 
 		ID3D11RenderTargetView* savedRTVs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
 		ID3D11DepthStencilView* savedDSV = nullptr;
@@ -134,7 +141,7 @@ namespace NeuralRendering
 		const bool succeeded = Renderer::Instance().Apply(globals::d3d::device, context, 0,
 			color->resource.get(), depth.texture, depth.depthSRV,
 			upscaling.motionVectorCopyTexture->resource.get(), motionDesc.Width, motionDesc.Height,
-			colorDesc.Width, colorDesc.Height, static_cast<float>(motionDesc.Width),
+			guideContentWidth, guideContentHeight, colorDesc.Width, colorDesc.Height, static_cast<float>(motionDesc.Width),
 			static_cast<float>(motionDesc.Height), GetTuning(upscaling.settings),
 			sharedDevice, sharedQueue);
 		if (succeeded) {
