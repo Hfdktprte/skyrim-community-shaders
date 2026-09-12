@@ -3,7 +3,9 @@
 #include "D3D12Interop.h"
 #include "Util.h"
 
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <utility>
 
 #include <d3d11.h>
@@ -51,6 +53,8 @@ namespace NeuralRendering
 	class Renderer::State
 	{
 	public:
+		static constexpr std::uint32_t kMaxPasses = 10;
+
 		struct EyeResources
 		{
 			SharedTexture color;
@@ -63,6 +67,7 @@ namespace NeuralRendering
 			ID3D11Resource* color, ID3D11Resource* depth, ID3D11ShaderResourceView* depthSRV,
 			ID3D11Resource* motionVectors,
 			std::uint32_t guideWidth, std::uint32_t guideHeight,
+			std::uint32_t guideContentWidth, std::uint32_t guideContentHeight,
 			std::uint32_t colorWidth, std::uint32_t colorHeight,
 			float motionVectorScaleX, float motionVectorScaleY, const Tuning& tuning,
 			ID3D12Device* sharedDevice, ID3D12CommandQueue* sharedQueue)
@@ -73,45 +78,96 @@ namespace NeuralRendering
 				return false;
 			if (Runtime::Instance().Status() != RuntimeStatus::Initialized && !InitializeRuntime())
 				return false;
-			if (!EnsureResources(eyeIndex, color, depth, motionVectors, guideWidth, guideHeight, colorWidth, colorHeight))
+			const auto processingWidth = std::clamp(static_cast<std::uint32_t>(
+				std::lround(static_cast<double>(colorWidth) * tuning.processingScale)), 1u, 16384u);
+			const auto processingHeight = std::clamp(static_cast<std::uint32_t>(
+				std::lround(static_cast<double>(colorHeight) * tuning.processingScale)), 1u, 16384u);
+			const auto passCount = std::clamp(tuning.passCount, 1u, kMaxPasses);
+			if (!EnsureResources(eyeIndex, color, depth, motionVectors, guideWidth, guideHeight,
+				processingWidth, processingHeight))
 				return LatchFailure("shared resource creation", interop.LastError());
+			if (lastGuideContentWidth[eyeIndex] != guideContentWidth ||
+				lastGuideContentHeight[eyeIndex] != guideContentHeight) {
+				if (lastGuideContentWidth[eyeIndex] != 0) {
+					if (!interop.WaitForIdle())
+						return LatchFailure("motion guide resize wait", interop.LastError());
+					for (std::uint32_t passIndex = 0; passIndex < kMaxPasses; ++passIndex)
+						Runtime::Instance().ResetFeature(eyeIndex * kMaxPasses + passIndex);
+				}
+				lastGuideContentWidth[eyeIndex] = guideContentWidth;
+				lastGuideContentHeight[eyeIndex] = guideContentHeight;
+				resetPending[eyeIndex] = true;
+				logger::info("[DLSSNR] motion guide eye={} active={}x{} expanded={}x{}",
+					eyeIndex, guideContentWidth, guideContentHeight, guideWidth, guideHeight);
+			}
 
 			auto& eye = eyes[eyeIndex];
-			context->CopyResource(eye.color.resource11.Get(), color);
+			const bool requiresResampling = processingWidth != colorWidth || processingHeight != colorHeight;
+			if (requiresResampling) {
+				Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> sourceView;
+				if (FAILED(device->CreateShaderResourceView(color, nullptr, &sourceView)) ||
+					!ResampleColor(context, sourceView.Get(), eye.color.uav11.Get(), processingWidth, processingHeight))
+					return LatchFailure("color downsampling", E_FAIL);
+			} else {
+				context->CopyResource(eye.color.resource11.Get(), color);
+			}
 			if (!CopyDepthGuide(context, depthSRV, eye.depth.uav11.Get(), guideWidth, guideHeight))
 				return LatchFailure("depth guide conversion", E_FAIL);
-			context->CopyResource(eye.motionVectors.resource11.Get(), motionVectors);
+			if (guideContentWidth != guideWidth || guideContentHeight != guideHeight) {
+				Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motionView;
+				if (FAILED(device->CreateShaderResourceView(motionVectors, nullptr, &motionView)) ||
+					!ResampleMotionGuide(device, context, motionView.Get(), eye.motionVectors.uav11.Get(),
+						guideContentWidth, guideContentHeight, guideWidth, guideHeight))
+					return LatchFailure("motion guide upsampling", E_FAIL);
+			} else {
+				context->CopyResource(eye.motionVectors.resource11.Get(), motionVectors);
+			}
 
 			ID3D12GraphicsCommandList* commandList = nullptr;
 			if (!interop.BeginD3D12(&commandList))
 				return LatchFailure("BeginD3D12", interop.LastError());
-			D3D12_RESOURCE_BARRIER barriers[4]{};
-			ID3D12Resource* resources[4]{
-				eye.color.resource12.Get(), eye.depth.resource12.Get(),
-				eye.motionVectors.resource12.Get(), eye.output.resource12.Get()
-			};
-			for (std::size_t index = 0; index < std::size(barriers); ++index) {
-				barriers[index].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-				barriers[index].Transition.pResource = resources[index];
-				barriers[index].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-				barriers[index].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-				barriers[index].Transition.StateAfter = index == 3 ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS :
-				                                                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+			bool succeeded = true;
+			for (std::uint32_t passIndex = 0; passIndex < passCount; ++passIndex) {
+				auto* passInput = passIndex % 2 == 0 ? &eye.color : &eye.output;
+				auto* passOutput = passIndex % 2 == 0 ? &eye.output : &eye.color;
+				D3D12_RESOURCE_BARRIER barriers[4]{};
+				ID3D12Resource* resources[4]{
+					passInput->resource12.Get(), eye.depth.resource12.Get(),
+					eye.motionVectors.resource12.Get(), passOutput->resource12.Get()
+				};
+				for (std::size_t index = 0; index < std::size(barriers); ++index) {
+					barriers[index].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+					barriers[index].Transition.pResource = resources[index];
+					barriers[index].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+					barriers[index].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+					barriers[index].Transition.StateAfter = index == 3 ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS :
+					                                                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+				}
+				commandList->ResourceBarrier(static_cast<UINT>(std::size(barriers)), barriers);
+				succeeded = Runtime::Instance().Execute(commandList, eyeIndex * kMaxPasses + passIndex,
+					passInput->resource12.Get(), eye.depth.resource12.Get(), eye.motionVectors.resource12.Get(),
+					passOutput->resource12.Get(), guideWidth, guideHeight, processingWidth, processingHeight,
+					motionVectorScaleX, motionVectorScaleY, tuning, resetPending[eyeIndex]);
+				for (auto& barrier : barriers)
+					std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+				commandList->ResourceBarrier(static_cast<UINT>(std::size(barriers)), barriers);
+				if (!succeeded)
+					break;
 			}
-			commandList->ResourceBarrier(static_cast<UINT>(std::size(barriers)), barriers);
-			const bool succeeded = Runtime::Instance().Execute(commandList, eyeIndex,
-				eye.color.resource12.Get(), eye.depth.resource12.Get(), eye.motionVectors.resource12.Get(),
-				eye.output.resource12.Get(), guideWidth, guideHeight, colorWidth, colorHeight,
-				motionVectorScaleX, motionVectorScaleY, tuning, resetPending[eyeIndex]);
-			for (auto& barrier : barriers)
-				std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
-			commandList->ResourceBarrier(static_cast<UINT>(std::size(barriers)), barriers);
 			if (!interop.EndD3D12())
 				return LatchFailure("EndD3D12", interop.LastError());
 			if (!succeeded)
 				return LatchFailure("Feature 18", static_cast<HRESULT>(Runtime::Instance().NgxResult()));
 
-			context->CopyResource(color, eye.output.resource11.Get());
+			auto& finalOutput = passCount % 2 == 0 ? eye.color : eye.output;
+			if (requiresResampling) {
+				Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> destinationView;
+				if (FAILED(device->CreateUnorderedAccessView(color, nullptr, &destinationView)) ||
+					!ResampleColor(context, finalOutput.srv11.Get(), destinationView.Get(), colorWidth, colorHeight))
+					return LatchFailure("color upsampling", E_FAIL);
+			} else {
+				context->CopyResource(color, finalOutput.resource11.Get());
+			}
 			resetPending[eyeIndex] = false;
 			return true;
 		}
@@ -207,8 +263,13 @@ namespace NeuralRendering
 			interop.Shutdown();
 			eyes = {};
 			resetPending = { true, true };
+			lastGuideContentWidth = {};
+			lastGuideContentHeight = {};
 			failureLatched = false;
 			copyDepthGuideCS.Reset();
+			scaleColorCS.Reset();
+			scaleMotionGuideCS.Reset();
+			scaleMotionGuideCB.Reset();
 		}
 
 		void ResetHistory()
@@ -221,6 +282,71 @@ namespace NeuralRendering
 		[[nodiscard]] bool IsFailureLatched() const { return failureLatched; }
 
 	private:
+		bool ResampleColor(ID3D11DeviceContext* context, ID3D11ShaderResourceView* source,
+			ID3D11UnorderedAccessView* destination, std::uint32_t width, std::uint32_t height)
+		{
+			if (!scaleColorCS) {
+				scaleColorCS.Attach(static_cast<ID3D11ComputeShader*>(Util::CompileShader(
+					L"Data\\Shaders\\Upscaling\\NeuralRendering\\ScaleColorCS.hlsl", {}, "cs_5_0")));
+				if (scaleColorCS)
+					Util::SetResourceName(scaleColorCS.Get(), "NeuralRendering::ScaleColorCS");
+			}
+			if (!scaleColorCS || !source || !destination)
+				return false;
+			context->CSSetShader(scaleColorCS.Get(), nullptr, 0);
+			context->CSSetShaderResources(0, 1, &source);
+			context->CSSetUnorderedAccessViews(0, 1, &destination, nullptr);
+			context->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
+			ID3D11ShaderResourceView* nullSRV = nullptr;
+			ID3D11UnorderedAccessView* nullUAV = nullptr;
+			context->CSSetShaderResources(0, 1, &nullSRV);
+			context->CSSetUnorderedAccessViews(0, 1, &nullUAV, nullptr);
+			context->CSSetShader(nullptr, nullptr, 0);
+			return true;
+		}
+
+		bool ResampleMotionGuide(ID3D11Device* device, ID3D11DeviceContext* context,
+			ID3D11ShaderResourceView* source, ID3D11UnorderedAccessView* destination,
+			std::uint32_t sourceWidth, std::uint32_t sourceHeight,
+			std::uint32_t destinationWidth, std::uint32_t destinationHeight)
+		{
+			if (!scaleMotionGuideCS) {
+				scaleMotionGuideCS.Attach(static_cast<ID3D11ComputeShader*>(Util::CompileShader(
+					L"Data\\Shaders\\Upscaling\\NeuralRendering\\ScaleMotionGuideCS.hlsl", {}, "cs_5_0")));
+				if (scaleMotionGuideCS)
+					Util::SetResourceName(scaleMotionGuideCS.Get(), "NeuralRendering::ScaleMotionGuideCS");
+			}
+			if (!scaleMotionGuideCB) {
+				D3D11_BUFFER_DESC desc{};
+				desc.ByteWidth = 16;
+				desc.Usage = D3D11_USAGE_DEFAULT;
+				desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+				if (FAILED(device->CreateBuffer(&desc, nullptr, &scaleMotionGuideCB)))
+					return false;
+				Util::SetResourceName(scaleMotionGuideCB.Get(), "NeuralRendering::ScaleMotionGuideCB");
+			}
+			if (!scaleMotionGuideCS || !source || !destination || !sourceWidth || !sourceHeight ||
+				!destinationWidth || !destinationHeight)
+				return false;
+
+			const std::uint32_t dimensions[4]{ sourceWidth, sourceHeight, destinationWidth, destinationHeight };
+			context->UpdateSubresource(scaleMotionGuideCB.Get(), 0, nullptr, dimensions, 0, 0);
+			ID3D11Buffer* constantBuffer = scaleMotionGuideCB.Get();
+			context->CSSetConstantBuffers(0, 1, &constantBuffer);
+			context->CSSetShader(scaleMotionGuideCS.Get(), nullptr, 0);
+			context->CSSetShaderResources(0, 1, &source);
+			context->CSSetUnorderedAccessViews(0, 1, &destination, nullptr);
+			context->Dispatch((destinationWidth + 7) / 8, (destinationHeight + 7) / 8, 1);
+			ID3D11ShaderResourceView* nullSRV = nullptr;
+			ID3D11UnorderedAccessView* nullUAV = nullptr;
+			ID3D11Buffer* nullCB = nullptr;
+			context->CSSetShaderResources(0, 1, &nullSRV);
+			context->CSSetUnorderedAccessViews(0, 1, &nullUAV, nullptr);
+			context->CSSetConstantBuffers(0, 1, &nullCB);
+			context->CSSetShader(nullptr, nullptr, 0);
+			return true;
+		}
+
 		bool CopyDepthGuide(ID3D11DeviceContext* context, ID3D11ShaderResourceView* source,
 			ID3D11UnorderedAccessView* destination, std::uint32_t width, std::uint32_t height)
 		{
@@ -277,7 +403,7 @@ namespace NeuralRendering
 				return false;
 			const UINT sharedFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
 			auto colorDesc = MakeSharedDesc(colorSource, colorWidth, colorHeight, sharedFlags);
-			auto outputDesc = MakeSharedDesc(colorSource, colorWidth, colorHeight, D3D11_BIND_UNORDERED_ACCESS);
+			auto outputDesc = MakeSharedDesc(colorSource, colorWidth, colorHeight, sharedFlags);
 			auto depthDesc = MakeSharedDesc(depthSource, guideWidth, guideHeight, sharedFlags);
 			depthDesc.Format = DXGI_FORMAT_R32_FLOAT;
 			auto motionDesc = MakeSharedDesc(motionSource, guideWidth, guideHeight, sharedFlags);
@@ -288,7 +414,8 @@ namespace NeuralRendering
 
 			if (!interop.WaitForIdle())
 				return false;
-			Runtime::Instance().ResetFeature(eyeIndex);
+			for (std::uint32_t passIndex = 0; passIndex < kMaxPasses; ++passIndex)
+				Runtime::Instance().ResetFeature(eyeIndex * kMaxPasses + passIndex);
 			eye = {};
 			const std::string suffix = eyeIndex == 0 ? "Left" : "Right";
 			if (!interop.CreateSharedTexture(colorDesc, eye.color, ("NeuralRendering::Color" + suffix).c_str()) ||
@@ -311,8 +438,13 @@ namespace NeuralRendering
 
 		D3D12Interop interop;
 		Microsoft::WRL::ComPtr<ID3D11ComputeShader> copyDepthGuideCS;
+		Microsoft::WRL::ComPtr<ID3D11ComputeShader> scaleColorCS;
+		Microsoft::WRL::ComPtr<ID3D11ComputeShader> scaleMotionGuideCS;
+		Microsoft::WRL::ComPtr<ID3D11Buffer> scaleMotionGuideCB;
 		std::array<EyeResources, 2> eyes;
 		std::array<bool, 2> resetPending{ true, true };
+		std::array<std::uint32_t, 2> lastGuideContentWidth{};
+		std::array<std::uint32_t, 2> lastGuideContentHeight{};
 		bool failureLatched = false;
 	};
 
@@ -323,12 +455,15 @@ namespace NeuralRendering
 	bool Renderer::Apply(ID3D11Device* device, ID3D11DeviceContext* context, std::uint32_t eyeIndex,
 		ID3D11Resource* color, ID3D11Resource* depth, ID3D11ShaderResourceView* depthSRV,
 		ID3D11Resource* motionVectors,
-		std::uint32_t guideWidth, std::uint32_t guideHeight, std::uint32_t colorWidth, std::uint32_t colorHeight,
+		std::uint32_t guideWidth, std::uint32_t guideHeight,
+		std::uint32_t guideContentWidth, std::uint32_t guideContentHeight,
+		std::uint32_t colorWidth, std::uint32_t colorHeight,
 		float motionVectorScaleX, float motionVectorScaleY, const Tuning& tuning,
 		ID3D12Device* sharedDevice, ID3D12CommandQueue* sharedQueue)
 	{
 		return state_->Apply(device, context, eyeIndex, color, depth, depthSRV, motionVectors,
-			guideWidth, guideHeight, colorWidth, colorHeight, motionVectorScaleX, motionVectorScaleY, tuning,
+			guideWidth, guideHeight, guideContentWidth, guideContentHeight, colorWidth, colorHeight,
+			motionVectorScaleX, motionVectorScaleY, tuning,
 			sharedDevice, sharedQueue);
 	}
 
@@ -348,3 +483,4 @@ namespace NeuralRendering
 	std::uint64_t Renderer::SuccessfulFrames() const { return Runtime::Instance().SuccessfulFrames(); }
 	const char* Renderer::StatusText() const { return ToString(Runtime::Instance().Status()); }
 }
+

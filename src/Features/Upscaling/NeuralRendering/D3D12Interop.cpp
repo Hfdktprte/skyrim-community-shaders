@@ -119,6 +119,14 @@ namespace NeuralRendering
 			return RecordFailure(result);
 		}
 		Util::SetResourceName(replacement.uav11.Get(), "%s UAV", name);
+		if (desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) {
+			result = device11_->CreateShaderResourceView(replacement.resource11.Get(), nullptr, &replacement.srv11);
+			if (FAILED(result)) {
+				lastOperation_ = "D3D11CreateShaderResourceView";
+				return RecordFailure(result);
+			}
+			Util::SetResourceName(replacement.srv11.Get(), "%s SRV", name);
+		}
 
 		Microsoft::WRL::ComPtr<IDXGIResource1> dxgiResource;
 		result = replacement.resource11.As(&dxgiResource);
@@ -229,3 +237,4 @@ namespace NeuralRendering
 		return WaitForFence(lastSubmittedValue);
 	}
 }
+

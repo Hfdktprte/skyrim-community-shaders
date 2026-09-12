@@ -4,7 +4,6 @@
 #include "Deferred.h"
 #include "HDRDisplay.h"
 #include "Hooks.h"
-#include "PostProcessing.h"
 #include "State.h"
 #include "Upscaling/DX12SwapChain.h"
 #include "Upscaling/FidelityFX.h"
@@ -13,12 +12,15 @@
 #include "Upscaling/Streamline.h"
 #include "Utils/Game.h"
 #include "Utils/UI.h"
+#include "Utils/VersionedRelocation.h"
 #include <Windows.h>
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
 #include <directx/d3dx12.h>
 #include <format>
+
+#include "Features/PostProcessing.h"
 
 #define I18N_KEY_PREFIX "feature.upscaling."
 
@@ -46,7 +48,10 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	neuralRenderingIntensity,
 	neuralRenderingLocalTone,
 	neuralRenderingLocalStructure,
+	neuralRenderingGlobalTone,
 	neuralRenderingSkinStructure,
+	neuralRenderingResolutionScale,
+	neuralRenderingPassCount,
 	neuralRenderingStyle,
 	neuralRenderingAutoMask,
 	neuralRenderingUICorrection);
@@ -309,38 +314,36 @@ void Upscaling::DrawSettings()
 			}
 
 			if (ImGui::CollapsingHeader(T(TKEY("neural_rendering_header"), "DLSS 5 Neural Rendering"), ImGuiTreeNodeFlags_DefaultOpen)) {
-				ImGui::Checkbox(T(TKEY("neural_rendering_enable"), "Enable DLSS 5 Neural Rendering"), &settings.neuralRenderingEnabled);
+				bool neuralSettingsChanged = ImGui::Checkbox(T(TKEY("neural_rendering_enable"), "Enable DLSS 5 Neural Rendering"), &settings.neuralRenderingEnabled);
 				if (globals::features::hdrDisplay.loaded && globals::features::hdrDisplay.settings.enableHDR)
 					Util::Text::Warning("DLSS 5 Neural Rendering currently requires HDR Display to be disabled.");
 				if (settings.neuralRenderingEnabled) {
-					static const char* tuningPresets[] = { "Custom", "Balanced", "Fabric Detail", "Natural", "Strong" };
-					int tuningPreset = static_cast<int>(settings.neuralRenderingPreset);
-					if (ImGui::Combo(T(TKEY("neural_rendering_preset"), "Tuning Preset"), &tuningPreset, tuningPresets, IM_ARRAYSIZE(tuningPresets))) {
-						settings.neuralRenderingPreset = static_cast<uint>(tuningPreset);
-						switch (settings.neuralRenderingPreset) {
-						case 1: settings.neuralRenderingIntensity = 1.0f; settings.neuralRenderingLocalTone = 1.0f; settings.neuralRenderingLocalStructure = 1.0f; settings.neuralRenderingSkinStructure = 1.0f; break;
-						case 2: settings.neuralRenderingIntensity = 1.35f; settings.neuralRenderingLocalTone = 0.9f; settings.neuralRenderingLocalStructure = 1.6f; settings.neuralRenderingSkinStructure = 1.15f; break;
-						case 3: settings.neuralRenderingIntensity = 0.8f; settings.neuralRenderingLocalTone = 0.75f; settings.neuralRenderingLocalStructure = 0.9f; settings.neuralRenderingSkinStructure = 0.9f; break;
-						case 4: settings.neuralRenderingIntensity = 1.75f; settings.neuralRenderingLocalTone = 1.25f; settings.neuralRenderingLocalStructure = 1.5f; settings.neuralRenderingSkinStructure = 1.3f; break;
-						default: break;
-						}
-					}
-					bool custom = false;
-					custom |= ImGui::SliderFloat(T(TKEY("neural_rendering_intensity"), "Intensity"), &settings.neuralRenderingIntensity, 0.0f, 2.0f, "%.2f");
-					custom |= ImGui::SliderFloat(T(TKEY("neural_rendering_local_tone"), "Local Tone"), &settings.neuralRenderingLocalTone, 0.0f, 2.0f, "%.2f");
-					custom |= ImGui::SliderFloat(T(TKEY("neural_rendering_local_structure"), "Local Structure"), &settings.neuralRenderingLocalStructure, 0.0f, 2.0f, "%.2f");
-					custom |= ImGui::SliderFloat(T(TKEY("neural_rendering_skin_structure"), "Skin Structure"), &settings.neuralRenderingSkinStructure, 0.0f, 2.0f, "%.2f");
-					static const char* styles[] = { "Style 0", "Style 1", "Style 2", "Style 3" };
+					static const char* styles[] = { "Default", "Natural", "Cinematic" };
 					int style = static_cast<int>(settings.neuralRenderingStyle);
-					if (ImGui::Combo(T(TKEY("neural_rendering_style"), "Style"), &style, styles, IM_ARRAYSIZE(styles))) {
+					if (ImGui::Combo(T(TKEY("neural_rendering_style"), "Model"), &style, styles, IM_ARRAYSIZE(styles))) {
 						settings.neuralRenderingStyle = static_cast<uint>(style);
-						custom = true;
+						neuralSettingsChanged = true;
 					}
-					custom |= ImGui::Checkbox(T(TKEY("neural_rendering_auto_mask"), "Automatic Mask"), &settings.neuralRenderingAutoMask);
-					custom |= ImGui::Checkbox(T(TKEY("neural_rendering_ui_correction"), "UI Correction"), &settings.neuralRenderingUICorrection);
-					if (custom)
-						settings.neuralRenderingPreset = 0;
+					neuralSettingsChanged |= ImGui::SliderFloat(T(TKEY("neural_rendering_intensity"), "Overall Intensity"), &settings.neuralRenderingIntensity, 0.0f, 1.0f, "%.2f");
+					neuralSettingsChanged |= ImGui::SliderFloat(T(TKEY("neural_rendering_local_structure"), "Structure Intensity"), &settings.neuralRenderingLocalStructure, 0.0f, 1.0f, "%.2f");
+					neuralSettingsChanged |= ImGui::SliderFloat(T(TKEY("neural_rendering_global_tone"), "Global Tone Intensity"), &settings.neuralRenderingGlobalTone, 0.0f, 1.0f, "%.2f");
+					neuralSettingsChanged |= ImGui::SliderFloat(T(TKEY("neural_rendering_local_tone"), "Local Tone Intensity"), &settings.neuralRenderingLocalTone, 0.0f, 1.0f, "%.2f");
+					neuralSettingsChanged |= ImGui::Checkbox(T(TKEY("neural_rendering_auto_mask"), "Character Mask"), &settings.neuralRenderingAutoMask);
+					neuralSettingsChanged |= ImGui::SliderFloat(T(TKEY("neural_rendering_skin_structure"), "Skin Structure Strength"), &settings.neuralRenderingSkinStructure, 0.0f, 1.0f, "%.2f");
+					neuralSettingsChanged |= ImGui::Checkbox(T(TKEY("neural_rendering_ui_correction"), "UI Correction"), &settings.neuralRenderingUICorrection);
+					neuralSettingsChanged |= ImGui::SliderFloat(T(TKEY("neural_rendering_resolution_scale"), "Resolution Scale"), &settings.neuralRenderingResolutionScale, 25.0f, 200.0f, "%.0f%%");
+					if (auto _tt = Util::HoverTooltipWrapper())
+						ImGui::TextUnformatted("Scales both dimensions. 200% processes four times as many pixels as 100%.");
+					int passCount = static_cast<int>(settings.neuralRenderingPassCount);
+					if (ImGui::SliderInt(T(TKEY("neural_rendering_pass_count"), "Number of Passes"), &passCount, 1, 10)) {
+						settings.neuralRenderingPassCount = static_cast<uint>(passCount);
+						neuralSettingsChanged = true;
+					}
+					if (auto _tt = Util::HoverTooltipWrapper())
+						ImGui::TextUnformatted("Runs Neural Rendering repeatedly. Each extra pass has a large performance cost.");
 					auto& neuralRenderer = NeuralRendering::Renderer::Instance();
+					if (neuralSettingsChanged)
+						neuralRenderer.ResetHistory();
 					if (neuralRenderer.IsFailureLatched()) {
 						Util::Text::Warning("DLSS 5 Neural Rendering failed for this session. Check CommunityShaders.log.");
 						if (ImGui::Button("Reset DLSS 5 Failure"))
@@ -569,8 +572,11 @@ void Upscaling::LoadSettings(json& o_json)
 	settings.neuralRenderingIntensity = std::clamp(settings.neuralRenderingIntensity, 0.0f, 2.0f);
 	settings.neuralRenderingLocalTone = std::clamp(settings.neuralRenderingLocalTone, 0.0f, 2.0f);
 	settings.neuralRenderingLocalStructure = std::clamp(settings.neuralRenderingLocalStructure, 0.0f, 2.0f);
+	settings.neuralRenderingGlobalTone = std::clamp(settings.neuralRenderingGlobalTone, 0.0f, 2.0f);
 	settings.neuralRenderingSkinStructure = std::clamp(settings.neuralRenderingSkinStructure, 0.0f, 2.0f);
-	settings.neuralRenderingStyle = std::min(settings.neuralRenderingStyle, 3u);
+	settings.neuralRenderingResolutionScale = std::clamp(settings.neuralRenderingResolutionScale, 25.0f, 200.0f);
+	settings.neuralRenderingPassCount = std::clamp(settings.neuralRenderingPassCount, 1u, 10u);
+	settings.neuralRenderingStyle = std::min(settings.neuralRenderingStyle, 2u);
 	auto iniSettingCollection = globals::game::iniPrefSettingCollection;
 	if (iniSettingCollection) {
 		auto setting = iniSettingCollection->GetSetting("bUseTAA:Display");
@@ -618,7 +624,7 @@ void Upscaling::PostPostLoad()
 	stl::detour_thunk<MenuManagerDrawInterfaceStartHook>(REL::RelocationID(79947, 82084));
 
 	// Calculates resolution and jitter
-	stl::write_thunk_call<Main_UpdateJitter>(REL::RelocationID(75460, 77245).address() + REL::Relocate(0xE5, isGOG ? 0x133 : 0xE2));
+	stl::write_thunk_call<Main_UpdateJitter>(REL::RelocationID(75460, 77245).address() + Util::VersionedRelocation::Select(0xE5, isGOG ? 0x133 : 0xE2, 0x133));
 
 	// Disables the original dynamic resolution system
 	REL::safe_write(REL::RelocationID(35556, 36555).address() + REL::Relocate(0x2D, 0x2D), REL::NOP5, sizeof(REL::NOP5));
@@ -633,7 +639,7 @@ void Upscaling::PostPostLoad()
 	stl::detour_thunk<BSFaceGenManager_UpdatePendingCustomizationTextures>(REL::RelocationID(26455, 27041));
 
 	// Patches precipitation camera to not use dynamic resolution
-	stl::write_thunk_call<Main_RenderPrecipitation>(REL::RelocationID(35560, 36559).address() + REL::Relocate(0x3A1, 0x3A1));
+	stl::write_thunk_call<Main_RenderPrecipitation>(REL::RelocationID(35560, 36559).address() + Util::VersionedRelocation::Select(0x3A1, 0x3A1, 0x3BF));
 
 	// Forces FXAA off
 	stl::detour_thunk<BSImageSpace_Init_FXAA>(REL::RelocationID(98974, 105626));
@@ -1071,7 +1077,6 @@ void Upscaling::SetupResources()
 		dx12SwapChain.CreateSharedResources();
 
 	copyDepthToSharedBufferPS.attach((ID3D11PixelShader*)Util::CompileShader(L"Data\\Shaders\\Upscaling\\CopyDepthToSharedBufferPS.hlsl", { { "PSHADER", "" } }, "ps_5_0"));
-
 }
 
 void Upscaling::ClearShaderCache()
@@ -1733,11 +1738,15 @@ void Upscaling::MenuManagerDrawInterfaceStartHook::thunk(int64_t a1)
 
 void Upscaling::Main_PostProcessing::thunk(RE::ImageSpaceManager* a_this, uint32_t a3, RE::RENDER_TARGET a_target, void* a_4, bool a_5)
 {
+	auto& postProcessing = globals::features::postProcessing;
+	if (postProcessing.loaded) {
+		postProcessing.DrawBeforeUpscaling();
+	}
+
 	auto& upscaling = globals::features::upscaling;
 	auto upscaleMethod = upscaling.GetUpscaleMethod();
 
 	if (upscaling.ShouldUseFrameGenerationThisFrame()) {
-		auto& postProcessing = globals::features::postProcessing;
 		if (postProcessing.loaded)
 			postProcessing.ClearBorderMotionVectorsForFrameGen();
 		upscaling.CopySharedD3D12Resources();
@@ -1802,3 +1811,4 @@ void Upscaling::BSFaceGenManager_UpdatePendingCustomizationTextures::thunk()
 	func();
 	runtimeData.dynamicResolutionLock = 0;
 }
+
