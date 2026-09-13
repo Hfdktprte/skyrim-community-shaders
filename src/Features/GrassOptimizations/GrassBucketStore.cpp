@@ -197,25 +197,25 @@ void GrassBucketStore::ApplyCaptures(std::vector<PendingCapture>& captures)
 	auto* ctx = globals::d3d::context;
 
 	for (auto& pc : captures) {
-		const uint32_t meshId = meshLibrary.ResolveMeshId(pc.shape);
+		const uint32_t meshId = meshLibrary.ResolveMeshId(pc.shape.get());
 		const uint32_t triCount = meshId ? 0u : (uint32_t)pc.shape->GetTrishapeRuntimeData().triangleCount;
-		const BucketKey bk{ meshId, pc.material, meshId ? nullptr : pc.diffuseTexture, triCount, meshId ? 0u : pc.descVal };
+		const BucketKey bk{ meshId, pc.material, meshId ? nullptr : pc.diffuseTexture.get(), triCount, meshId ? 0u : pc.descVal };
 		auto& b = buckets[bk];
 		b.meshId = meshId;
-		b.diffuseTexture = RE::NiPointer<RE::NiSourceTexture>(pc.diffuseTexture);
+		b.diffuseTexture = pc.diffuseTexture;
 
 		if (b.firstNewSlice == UINT32_MAX)
 			b.firstNewSlice = (uint32_t)b.slices.size();
 
 		if (!b.typeParamsValid) {
-			CacheBucketTypeParams(b, pc.shape);
-			b.isComplex = DetectComplexGrass(pc.diffuseTexture, ctx);
+			CacheBucketTypeParams(b, pc.shape.get());
+			b.isComplex = DetectComplexGrass(pc.diffuseTexture.get(), ctx);
 		}
 		if (frameParams.enableMeshLOD)
 			meshLibrary.EnsureLODMeshes(meshId);
 
 		BucketSlice s;
-		s.shape = pc.shape;
+		s.shape = pc.shape.get();
 		s.count = pc.count;
 		s.fadeStart = frameParams.fadeStart;
 		s.origin = pc.origin;
@@ -234,7 +234,7 @@ void GrassBucketStore::ApplyCaptures(std::vector<PendingCapture>& captures)
 		b.totalInstances += pc.count;
 		b.slices.push_back(std::move(s));
 		if (pc.shape)
-			pendingMapAdds.emplace_back(pc.shape, &b);
+		pendingMapAdds.emplace_back(pc.shape.get(), &b);
 		b.sliceBounds.push_back(sb);
 		b.clustersValid = false;
 		b.coarseValid = false;
@@ -391,10 +391,10 @@ bool GrassBucketStore::StageCapture(RE::BSMultiStreamInstanceTriShape* shape, co
 		return false;
 
 	PendingCapture pc;
-	pc.shape = shape;
+	pc.shape = RE::NiPointer<RE::BSMultiStreamInstanceTriShape>(shape);
 	pc.material = material;
 	pc.descVal = descVal;
-	pc.diffuseTexture = tex;
+	pc.diffuseTexture = RE::NiPointer<RE::NiSourceTexture>(tex);
 	pc.count = count;
 	pc.origin = shape->world.translate;
 	pc.bytes.resize((size_t)count * kGrassStride);

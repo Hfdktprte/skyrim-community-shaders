@@ -52,9 +52,11 @@ static_assert(sizeof(SliceBounds) == 32);
 /** @brief A capture queued by the cell-load hooks, applied to a bucket on the next grass frame. */
 struct PendingCapture
 {
-	RE::BSMultiStreamInstanceTriShape* shape = nullptr;
+	// Captures cross a render-thread/frame boundary. Retain the scene objects
+	// until ApplyCaptures consumes the queued capture.
+	RE::NiPointer<RE::BSMultiStreamInstanceTriShape> shape;
 	RE::BSShaderMaterial* material = nullptr;
-	RE::NiSourceTexture* diffuseTexture = nullptr;
+	RE::NiPointer<RE::NiSourceTexture> diffuseTexture;
 	std::vector<uint8_t> bytes;
 	uint32_t count = 0;
 	uint64_t descVal = 0;
