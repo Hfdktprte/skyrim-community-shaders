@@ -324,12 +324,12 @@ void Upscaling::DrawSettings()
 						settings.neuralRenderingStyle = static_cast<uint>(style);
 						neuralSettingsChanged = true;
 					}
-					neuralSettingsChanged |= ImGui::SliderFloat(T(TKEY("neural_rendering_intensity"), "Overall Intensity"), &settings.neuralRenderingIntensity, 0.0f, 1.0f, "%.2f");
-					neuralSettingsChanged |= ImGui::SliderFloat(T(TKEY("neural_rendering_local_structure"), "Structure Intensity"), &settings.neuralRenderingLocalStructure, 0.0f, 1.0f, "%.2f");
-					neuralSettingsChanged |= ImGui::SliderFloat(T(TKEY("neural_rendering_global_tone"), "Global Tone Intensity"), &settings.neuralRenderingGlobalTone, 0.0f, 1.0f, "%.2f");
-					neuralSettingsChanged |= ImGui::SliderFloat(T(TKEY("neural_rendering_local_tone"), "Local Tone Intensity"), &settings.neuralRenderingLocalTone, 0.0f, 1.0f, "%.2f");
+					neuralSettingsChanged |= ImGui::SliderFloat(T(TKEY("neural_rendering_intensity"), "Overall Intensity"), &settings.neuralRenderingIntensity, 0.0f, 2.0f, "%.2f");
+					neuralSettingsChanged |= ImGui::SliderFloat(T(TKEY("neural_rendering_local_structure"), "Structure Intensity"), &settings.neuralRenderingLocalStructure, 0.0f, 2.0f, "%.2f");
+					neuralSettingsChanged |= ImGui::SliderFloat(T(TKEY("neural_rendering_global_tone"), "Global Tone Intensity"), &settings.neuralRenderingGlobalTone, 0.0f, 2.0f, "%.2f");
+					neuralSettingsChanged |= ImGui::SliderFloat(T(TKEY("neural_rendering_local_tone"), "Local Tone Intensity"), &settings.neuralRenderingLocalTone, 0.0f, 2.0f, "%.2f");
 					neuralSettingsChanged |= ImGui::Checkbox(T(TKEY("neural_rendering_auto_mask"), "Character Mask"), &settings.neuralRenderingAutoMask);
-					neuralSettingsChanged |= ImGui::SliderFloat(T(TKEY("neural_rendering_skin_structure"), "Skin Structure Strength"), &settings.neuralRenderingSkinStructure, 0.0f, 1.0f, "%.2f");
+					neuralSettingsChanged |= ImGui::SliderFloat(T(TKEY("neural_rendering_skin_structure"), "Skin Structure Strength"), &settings.neuralRenderingSkinStructure, 0.0f, 2.0f, "%.2f");
 					neuralSettingsChanged |= ImGui::Checkbox(T(TKEY("neural_rendering_ui_correction"), "UI Correction"), &settings.neuralRenderingUICorrection);
 					neuralSettingsChanged |= ImGui::SliderFloat(T(TKEY("neural_rendering_resolution_scale"), "Resolution Scale"), &settings.neuralRenderingResolutionScale, 25.0f, 200.0f, "%.0f%%");
 					if (auto _tt = Util::HoverTooltipWrapper())
@@ -1811,4 +1811,3 @@ void Upscaling::BSFaceGenManager_UpdatePendingCustomizationTextures::thunk()
 	func();
 	runtimeData.dynamicResolutionLock = 0;
 }
-
