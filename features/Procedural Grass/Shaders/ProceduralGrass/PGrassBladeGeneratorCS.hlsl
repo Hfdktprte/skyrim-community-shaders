@@ -205,20 +205,17 @@ uint LoadGrassId(uint sampleIndex)
 	return (packed >> ((sampleIndex & 3u) << 3u)) & 0xFFu;
 }
 
-void ComputeGrassType(out uint type, float2 quadLocalPos, uint quadrant, float typeRandom)
+// PGRASS_LOD_SEAM_FIX: use identical 2x2 grass-map sampling in every LOD tier.
+// This prevents the Low -> Far transition from changing a soft LTEX boundary into
+// a nearest-sample hard boundary when the same LAND quadrant changes renderer tier.
+void ComputeGrassType(out uint type, out float bareCoverage, float2 quadLocalPos, uint quadrant, float typeRandom)
 {
 	float2 grassSample = clamp(quadLocalPos / QUADRANT_GRASS_SPACING, 0.0f, QUADRANT_GRASS_PITCH - 1.001f);
-
-#if defined(FAR_LOD)
-	// Far uses one nearest grass-type sample because type boundaries are sub-pixel at this distance.
-	int2 nearest = int2(grassSample + 0.5f);
-	uint id = LoadGrassId(quadrant * (QUADRANT_GRASS_PITCH * QUADRANT_GRASS_PITCH) + nearest.y * QUADRANT_GRASS_PITCH + nearest.x);
-	type = id;
-	return;
-#else
 	int2 baseSample = int2(grassSample);
 	float2 frac = grassSample - float2(baseSample);
 
+	// PGrassRenderer already uploads and binds this packed 2x2 buffer for Far as well
+	// as the near tiers, so matching the sampling costs a single structured-buffer load.
 	uint packed = QuadrantGrassCells[quadrant * 256u + baseSample.y * 16u + baseSample.x];
 	uint4 ids = uint4(packed & 0xFFu, (packed >> 8u) & 0xFFu, (packed >> 16u) & 0xFFu, packed >> 24u);
 
@@ -228,10 +225,19 @@ void ComputeGrassType(out uint type, float2 quadLocalPos, uint quadrant, float t
 	weights.z = (1 - frac.x) * frac.y;
 	weights.w = frac.x * frac.y;
 
+	// Fade blade height as a boundary approaches bare LAND. This hides residual
+	// density differences between Low and Far without changing the LTEX decision.
+	bareCoverage = 0.0f;
+	[unroll] for (int i = 0; i < 4; ++i)
+	{
+		if (ids[i] == 0)
+			bareCoverage += weights[i];
+	}
+
 	float weightSum = 0;
 	type = ids[3];
 
-	[unroll] for (int j = 0; j < 4; j++)
+	[unroll] for (int j = 0; j < 4; ++j)
 	{
 		weightSum += weights[j];
 		if (typeRandom < weightSum) {
@@ -239,7 +245,6 @@ void ComputeGrassType(out uint type, float2 quadLocalPos, uint quadrant, float t
 			break;
 		}
 	}
-#endif
 }
 
 /** Far has no clump displacement, so its final XY LOD decision is known before any terrain or grass-map access. */
@@ -360,11 +365,12 @@ void EmitBlade(
 			return;
 	}
 
-	// Fetch the grass type after culling to avoid the four-sample lookup for rejected blades.
+	// Fetch the grass type after culling to avoid the grass-map lookup for rejected blades.
 	uint type;
+	float bareCoverage;
 
 	float2 mapSamplePos = bladeQuadPos2D + (float2(hash.xy) * UINT_TO_FLOAT * 2.0f - 1.0f) * miscParams.x;
-	ComputeGrassType(type, mapSamplePos, quadrant, typeRand);
+	ComputeGrassType(type, bareCoverage, mapSamplePos, quadrant, typeRand);
 	if (type == 0 && !cullsDisabled)
 		return;
 	type = max(type, 1u);
@@ -426,6 +432,9 @@ void EmitBlade(
 	// Generate height after culling. The frustum test uses the maximum blade height.
 	float randClumpHeight = float(clumpRand) * UINT_TO_FLOAT;
 	float unscaledHeight = (0.45f + heightRand * 0.55f) - randClumpHeight * grassType.clumpHeightFactor;
+	// Keep the all-culls debug mode useful: only apply boundary shrink during normal generation.
+	if (!cullsDisabled)
+		unscaledHeight *= 1.0f - bareCoverage;
 	float randHeight = grassType.height * unscaledHeight;
 
 	// Blade width
