@@ -1,0 +1,111 @@
+name: ChatGPT AIO backports
+
+on:
+  push:
+    branches:
+      - chatgpt/aio-dev-backports
+
+permissions:
+  contents: write
+
+jobs:
+  apply-backports:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/community-shaders/skyrim-community-shaders.git
+
+      - name: Cherry-pick requested merged fixes
+        shell: bash
+        run: |
+          set -euo pipefail
+          picks=(
+            e99b4d6c176f6545c4aaeebab17c2f3bc7b71cfc  #2666 PBR decal
+            193a0c0d8a33f57acd4ad2ee561701e9b6ad6d58  #2645 256px cubemaps
+            18379f8bfeb27500815d8226f96a886fd611ba06  #2700 skylighting probe addressing
+            4ab5acab06ac95a207c917603b08e71451ab8d7b  #2712 FG screenshot
+            66369e5c58d1ca4c4f8a14a0b431340afba07a1a  #2714 VL dynamic-resolution bounds
+          )
+          for sha in "${picks[@]}"; do
+            echo "Fetching $sha"
+            git fetch --no-tags upstream "$sha"
+            if ! git cherry-pick -m 1 FETCH_HEAD; then
+              echo "Cherry-pick failed for $sha"
+              git status --short
+              git diff --name-only --diff-filter=U
+              exit 1
+            fi
+          done
+
+      - name: Port additive-lighting fog fix with AIO descriptor adaptation
+        shell: python
+        run: |
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              s = p.read_text(encoding="utf-8")
+              n = s.count(old)
+              if n != 1:
+                  raise RuntimeError(f"{path}: expected one anchor, found {n}")
+              p.write_text(s.replace(old, new, 1), encoding="utf-8")
+
+          # #2677 used bit 6 upstream. aio-dev already reserves bit 6 for IsEye,
+          # so keep IsEye intact and assign AdditiveLighting the next free bit (7).
+          replace_once(
+              "package/Shaders/Common/Permutation.hlsli",
+              "\t\tstatic const uint IsEye = (1 << 6);\n",
+              "\t\tstatic const uint IsEye = (1 << 6);\n\t\tstatic const uint AdditiveLighting = (1 << 7);\n",
+          )
+
+          replace_once(
+              "src/State.h",
+              "\tuint lastExtraFeatureDescriptor = 0;\n\n",
+              "\tuint lastExtraFeatureDescriptor = 0;\n\n\t/** Updates Lighting shader permutation state from the current render pass. */\n\tvoid UpdateLightingShaderPermutation(RE::BSRenderPass* a_pass);\n\n",
+          )
+          replace_once(
+              "src/State.h",
+              "\t\tSuppressExternalEmittance = 1 << 5,\n\t\tIsEye = 1 << 6\n",
+              "\t\tSuppressExternalEmittance = 1 << 5,\n\t\tIsEye = 1 << 6,\n\t\tAdditiveLighting = 1 << 7\n",
+          )
+
+          state_cpp = '''void State::UpdateLightingShaderPermutation(RE::BSRenderPass* a_pass)\n{\n\tconstexpr auto additiveLighting = static_cast<uint32_t>(ExtraShaderDescriptors::AdditiveLighting);\n\tpermutationData.ExtraShaderDescriptor &= ~additiveLighting;\n\n\tif (!a_pass || !a_pass->geometry)\n\t\treturn;\n\n\tauto* alphaProperty = a_pass->geometry->GetGeometryRuntimeData().alphaProperty.get();\n\tif (alphaProperty && alphaProperty->GetAlphaBlending() &&\n\t\talphaProperty->GetDestBlendMode() == RE::NiAlphaProperty::AlphaFunction::kOne) {\n\t\tpermutationData.ExtraShaderDescriptor |= additiveLighting;\n\t}\n}\n\n'''
+          replace_once(
+              "src/State.cpp",
+              "void State::UpdateSkyShaderPermutation(RE::BSRenderPass* a_pass)\n",
+              state_cpp + "void State::UpdateSkyShaderPermutation(RE::BSRenderPass* a_pass)\n",
+          )
+
+          lighting_hook = '''namespace LightingExtensions\n{\n\tstruct BSLightingShader_SetupGeometry\n\t{\n\t\tstatic void thunk(RE::BSShader* shader, RE::BSRenderPass* pass, uint32_t renderFlags)\n\t\t{\n\t\t\tglobals::state->UpdateLightingShaderPermutation(pass);\n\t\t\tfunc(shader, pass, renderFlags);\n\t\t}\n\t\tstatic inline REL::Relocation<decltype(thunk)> func;\n\t};\n}\n\n'''
+          replace_once(
+              "src/Hooks.cpp",
+              "namespace EffectExtensions\n{\n",
+              lighting_hook + "namespace EffectExtensions\n{\n",
+          )
+          replace_once(
+              "src/Hooks.cpp",
+              "\t\tlogger::info(\"Installing SetupGeometry hooks\");\n",
+              "\t\tlogger::info(\"Installing SetupGeometry hooks\");\n\t\tstl::write_vfunc<0x6, LightingExtensions::BSLightingShader_SetupGeometry>(RE::VTABLE_BSLightingShader[0]);\n",
+          )
+
+          replace_once(
+              "package/Shaders/Lighting.hlsl",
+              "\t\tfogColor = exponentialHeightFog.xyz;\n\t\tfogFactor = exponentialHeightFog.w;\n\t}\n#\t\tendif\n\tif ((FrameBuffer::FrameParams.y && FrameBuffer::FrameParams.z) || inReflection) {\n",
+              "\t\tfogColor = exponentialHeightFog.xyz;\n\t\tfogFactor = exponentialHeightFog.w;\n\t}\n#\t\tendif\n\tif ((Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::AdditiveLighting) != 0) {\n#\t\tif defined(EXP_HEIGHT_FOG)\n\t\tvanillaFogColor = 0.0;\n#\t\tendif\n\t\tfogColor = 0.0;\n\t}\n\tif ((FrameBuffer::FrameParams.y && FrameBuffer::FrameParams.z) || inReflection) {\n",
+          )
+
+      - name: Commit and push backports
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add package/Shaders/Common/Permutation.hlsli package/Shaders/Lighting.hlsl src/Hooks.cpp src/State.cpp src/State.h
+          git commit -m "fix(fog): backport additive lighting fog with AIO flag"
+          git push origin HEAD:chatgpt/aio-dev-backports
