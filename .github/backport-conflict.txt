@@ -1,0 +1,15 @@
+failed_sha=193a0c0d8a33f57acd4ad2ee561701e9b6ad6d58
+conflicts:
+package/Shaders/Lighting.hlsl
+status_before_abort:
+M  "features/Dynamic Cubemaps/Shaders/DynamicCubemaps/DynamicCubemaps.hlsli"
+M  "features/Dynamic Cubemaps/Shaders/DynamicCubemaps/InferCubemapCS.hlsl"
+M  "features/Dynamic Cubemaps/Shaders/Features/DynamicCubemaps.ini"
+M  "features/Exponential Height Fog/Shaders/ExponentialHeightFog/ExponentialHeightFog.hlsli"
+M  package/Shaders/DeferredCompositeCS.hlsl
+UU package/Shaders/Lighting.hlsl
+M  src/Features/DynamicCubemaps.cpp
+M  src/Features/DynamicCubemaps.h
+M  src/Features/ExponentialHeightFog.cpp
+M  src/Features/ExponentialHeightFog.h
+M  src/Hooks.cpp
