@@ -38,11 +38,22 @@ jobs:
             echo "Fetching $sha"
             git fetch --no-tags upstream "$sha"
             if ! git cherry-pick -m 1 FETCH_HEAD; then
-              echo "Cherry-pick failed for $sha"
-              git status --short
-              git diff --name-only --diff-filter=U
+              conflicts="$(git diff --name-only --diff-filter=U || true)"
+              status="$(git status --short || true)"
+              git cherry-pick --abort
+              {
+                echo "failed_sha=$sha"
+                echo "conflicts:"
+                echo "$conflicts"
+                echo "status_before_abort:"
+                echo "$status"
+              } > .github/backport-conflict.txt
+              git add .github/backport-conflict.txt
+              git commit -m "ci: record backport conflict $sha"
+              git push origin HEAD:chatgpt/aio-dev-backports
               exit 1
             fi
+            git push origin HEAD:chatgpt/aio-dev-backports
           done
 
       - name: Port additive-lighting fog fix with AIO descriptor adaptation
@@ -102,7 +113,7 @@ jobs:
               "\t\tfogColor = exponentialHeightFog.xyz;\n\t\tfogFactor = exponentialHeightFog.w;\n\t}\n#\t\tendif\n\tif ((Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::AdditiveLighting) != 0) {\n#\t\tif defined(EXP_HEIGHT_FOG)\n\t\tvanillaFogColor = 0.0;\n#\t\tendif\n\t\tfogColor = 0.0;\n\t}\n\tif ((FrameBuffer::FrameParams.y && FrameBuffer::FrameParams.z) || inReflection) {\n",
           )
 
-      - name: Commit and push backports
+      - name: Commit and push additive fog port
         shell: bash
         run: |
           set -euo pipefail
