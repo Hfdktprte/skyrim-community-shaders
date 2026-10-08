@@ -266,6 +266,59 @@ namespace Random
 	///////////////////////////////////////////////////////////
 	// NOISES
 	///////////////////////////////////////////////////////////
+	float CellNoise2D(int2 cell)
+	{
+		return float(iqint3(asuint(cell))) * (1.0f / 4294967296.0f);
+	}
+
+	float ValueNoise2D(float2 p)
+	{
+		int2 cell = int2(floor(p));
+		float2 fr = p - cell;
+		fr = fr * fr * (3.0 - 2.0 * fr);
+		float2 lower = float2(iqint3(asuint(cell)), iqint3(asuint(cell + int2(1, 0)))) * (1.0f / 4294967296.0f);
+		float2 upper = float2(iqint3(asuint(cell + int2(0, 1))), iqint3(asuint(cell + int2(1, 1)))) * (1.0f / 4294967296.0f);
+		return lerp(lerp(lower.x, lower.y, fr.x), lerp(upper.x, upper.y, fr.x), fr.y);
+	}
+
+	void UpdateNearestVoronoiCell2D(inout uint seed, inout float distanceSquared, inout float2 offset, int2 cell, float2 gridPos)
+	{
+		float2 cellMin = float2(cell);
+		float2 cellOffset = clamp(gridPos, cellMin, cellMin + 1.0f) - gridPos;
+		if (dot(cellOffset, cellOffset) >= distanceSquared)
+			return;
+		uint3 hash = pcg3d(uint3(asuint(cell), 0u));
+		float2 candidateOffset = cellMin + float2(hash.xy) * (1.0f / 4294967296.0f) - gridPos;
+		float candidateDistanceSquared = dot(candidateOffset, candidateOffset);
+		if (candidateDistanceSquared < distanceSquared) {
+			distanceSquared = candidateDistanceSquared;
+			offset = candidateOffset;
+			seed = hash.z;
+		}
+	}
+
+	void FindNearestVoronoi2D(float2 gridPos, out uint seed, out float distance, out float2 offset)
+	{
+		int2 gridCell = int2(floor(gridPos));
+		seed = 0u;
+		distance = 1.0e30f;
+		offset = 0.0f;
+		UpdateNearestVoronoiCell2D(seed, distance, offset, gridCell, gridPos);
+		[unroll] for (int y = -1; y <= 1; y++)
+			[unroll] for (int x = -1; x <= 1; x++)
+				if (x != 0 || y != 0)
+					UpdateNearestVoronoiCell2D(seed, distance, offset, gridCell + int2(x, y), gridPos);
+		distance = sqrt(distance);
+	}
+
+	void GetVoronoiCellFeature2D(float2 gridPos, out uint seed, out float distance, out float2 offset)
+	{
+		int2 gridCell = int2(floor(gridPos));
+		uint3 hash = pcg3d(uint3(asuint(gridCell), 0u));
+		offset = float2(gridCell) + float2(hash.xy) * (1.0f / 4294967296.0f) - gridPos;
+		distance = length(offset);
+		seed = hash.z;
+	}
 
 	// https://www.shadertoy.com/view/slB3z3
 	float3 perlinGradient(uint hash)

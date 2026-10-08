@@ -5,6 +5,7 @@
 
 namespace GBuffer
 {
+	static const float LandscapeMask = 1.0f;
 
 	half2 OctWrap(half2 v)
 	{

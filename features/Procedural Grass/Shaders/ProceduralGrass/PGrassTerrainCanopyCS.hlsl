@@ -1,4 +1,5 @@
 #define FRAMEBUFFER
+#define CSHADER
 #define TRUE_PBR
 #define GRASS_LIGHTING
 #define LOW_LOD

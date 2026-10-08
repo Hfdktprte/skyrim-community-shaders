@@ -123,7 +123,7 @@ void ProceduralGrass::RenderTerrainCanopy(ID3D11DeviceContext* ctx, RE::BSGraphi
 	ID3D11ShaderResourceView* hiZ = globals::hiZPyramid->GetSRV();
 	ID3D11ShaderResourceView* types = terrainCanopyTexture->srv.get();
 	ID3D11ShaderResourceView* ambient = distantAmbientLUT->srv.get();
-	ID3D11ShaderResourceView* ao = std::get<0>(globals::features::screenSpaceGI.GetOutputTextures());
+	ID3D11ShaderResourceView* ao = nullptr;
 	const auto* screenShadowTexture = globals::features::screenSpaceShadows.screenSpaceShadowsTexture;
 	ID3D11ShaderResourceView* screenShadow = screenShadowTexture ? screenShadowTexture->srv.get() : nullptr;
 	ctx->CSSetShaderResources(2, 1, &mask);

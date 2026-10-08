@@ -980,7 +980,7 @@ void ProceduralGrass::ForwardRenderFar() const
 
 	// Opaque depth makes Far output independent of append order.
 	ctx->OMSetDepthStencilState(depthWriteDS, 0);
-	ID3D11ShaderResourceView* screenAO = std::get<0>(globals::features::screenSpaceGI.GetOutputTextures());
+	ID3D11ShaderResourceView* screenAO = nullptr;
 	ctx->PSSetShaderResources(76, 1, &screenAO);
 	ID3D11ShaderResourceView* sceneDepthSRV = Util::GetCurrentSceneDepthSRV(false);
 	ctx->PSSetShaderResources(74, 1, &sceneDepthSRV);

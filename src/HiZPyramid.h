@@ -12,15 +12,13 @@ public:
 	 * @param ctx Immediate context the reduction dispatches are issued on.
 	 * @return True when the pyramid is valid for this frame.
 	 */
-	bool Build(ID3D11Device* device, ID3D11DeviceContext* ctx);
-
-	/** @brief Marks the pyramid unusable for this frame without releasing anything. */
-	void Invalidate() { valid = false; }
+	bool Build(ID3D11Device* device, ID3D11DeviceContext* ctx, bool forceRefresh = false);
 
 	/** @brief Returns the full-chain SRV, or nullptr when the pyramid is not valid this frame. */
-	ID3D11ShaderResourceView* GetSRV() const { return valid && texture ? texture->srv.get() : nullptr; }
+	ID3D11ShaderResourceView* GetSRV() const;
 	/** @brief Returns true when Build succeeded for the current frame. */
-	bool IsValid() const { return valid; }
+	bool IsValid() const;
+	bool HasCurrentSceneDepth() const { return IsValid() && usingLiveDepth; }
 	/** @brief Returns the base level width in texels. */
 	uint32_t GetWidth() const { return width; }
 	/** @brief Returns the base level height in texels. */
@@ -71,12 +69,11 @@ private:
 	bool usingLiveDepth = false;
 	std::array<uint32_t, 10> lastLogKey{};
 	std::vector<winrt::com_ptr<ID3D11UnorderedAccessView>> mipUAVs;
+	winrt::com_ptr<ID3D11ShaderResourceView> mip0SRV;
 	std::unique_ptr<ConstantBuffer> paramsCB;
 
 	ID3D11ComputeShader* baseCS = nullptr;
 	ID3D11ComputeShader* spdCS = nullptr;
-	// SPD's cross-group counter. The last group to finish the tile phase resets it for next frame.
-	std::unique_ptr<Buffer> spdCounter;
 
 	uint32_t width = 0;
 	uint32_t height = 0;
@@ -85,6 +82,7 @@ private:
 	uint32_t paddedHeight = 0;
 	uint32_t mipCount = 1;
 	bool valid = false;
+	uint32_t builtFrame = UINT32_MAX;
 
 	static constexpr uint32_t kDownsampleFactor = 4;
 	// SPD reduces a 64x64 tile wholly in LDS, so a base padded to that granularity halves exactly for

@@ -173,6 +173,7 @@ bool TerrainHeightMap::LoadForCurrentWorldspace()
 		cachedHeightmap = &heightmaps[worldspace_name];
 	}
 
+	++loadGeneration;
 	return true;
 }
 

@@ -33,6 +33,7 @@ public:
 	 * @return true if the cached heightmap changed, so callers can invalidate derived data.
 	 */
 	bool LoadForCurrentWorldspace();
+	uint32_t GetLoadGeneration() const { return loadGeneration; }
 
 	/** @brief Whether a heightmap is loaded and belongs to the worldspace the player is in. */
 	bool IsReady() const;
@@ -62,6 +63,7 @@ private:
 	void ParseHeightmapPath(std::filesystem::path p, bool xlodgen_style);
 
 	bool discovered = false;
+	uint32_t loadGeneration = 0;
 	std::unordered_map<std::string, Metadata> heightmaps;
 	Metadata* cachedHeightmap = nullptr;
 	std::unique_ptr<Texture2D> texHeightMap = nullptr;

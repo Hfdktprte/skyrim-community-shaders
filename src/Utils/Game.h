@@ -158,6 +158,7 @@ namespace Util
 	std::string FormatWeather(const RE::TESWeather* weather);
 
 	bool IsInterior();
+	RE::TESWorldSpace* GetLandDataWorldspace(RE::TESWorldSpace* worldSpace);
 
 	/**
 	 * @brief Converts a 2D world position to cell coordinates.
