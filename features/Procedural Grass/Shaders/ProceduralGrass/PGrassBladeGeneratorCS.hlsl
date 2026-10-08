@@ -13,12 +13,33 @@
 
 #include "ProceduralGrass/PGrassCommon.hlsli"
 
-#if defined(HIGH_LOD) && defined(SKYLIGHTING)
+#if defined(PGRASS_CACHED_COLLISION)
+#	define GRASS_COLLISION_CBUFFER_REGISTER b11
+#	if defined(MID_LOD)
+#		define GRASS_COLLISION_CURRENT_ONLY
+#	endif
+#	include "GrassCollision/GrassCollision.hlsli"
+#endif
+
+#if defined(SKYLIGHTING) && defined(HIGH_LOD)
 #	define SKYLIGHTING_PROBE_REGISTER t50
 #	include "Skylighting/Skylighting.hlsli"
 #endif
 
+#if defined(HIGH_LOD) && defined(TERRAIN_SHADOWS)
+#	include "TerrainShadows/TerrainShadows.hlsli"
+#endif
+
+#if defined(HIGH_LOD) && defined(CLOUD_SHADOWS)
+#	include "CloudShadows/CloudShadows.hlsli"
+#endif
+
 #define FRAMEBUFFER
+
+// A second list at the buffer's tail holds simpler near-tier blades or Far's double-blade handoff fill.
+#if defined(HIGH_GEOMETRY_LOD) || defined(MID_OUTER_GEOMETRY) || defined(LOW_OUTER_GEOMETRY) || defined(FAR_DOUBLE_GEOMETRY)
+#	define PGRASS_OUTER_LIST
+#endif
 
 #if defined(__INTELLISENSE__)
 #	define THREADGROUP_SIZE 8
@@ -27,7 +48,7 @@
 #	define SLOPE_EXTRA_BLADES 1
 #endif
 
-// Fallbacks for Intellisense and undefined compile paths.
+// Supply defaults for editor parsing and validation builds.
 #if !defined(PATCH_BLADE_COUNT)
 #	define PATCH_BLADE_COUNT 1
 #endif
@@ -35,7 +56,7 @@
 #	define SLOPE_EXTRA_BLADES 0
 #endif
 
-// Matches the cbuffer array to the renderer's quadrant capacity.
+// Match the constant-buffer array to the renderer's quadrant capacity.
 #if !defined(QUADRANT_DATA_SIZE)
 #	if defined(HIGH_LOD)
 #		define QUADRANT_DATA_SIZE 9
@@ -50,12 +71,29 @@ static const int TG_DIM_X = THREADGROUP_SIZE;
 static const int TG_DIM_Y = 1;
 static const uint BLADES_PER_ROW = DENSITY;
 
-static const int TG_SIZE = TG_DIM_X * TG_DIM_Y;
 static const uint PATCHES_PER_QUADRANT = BLADES_PER_ROW * BLADES_PER_ROW / 4;
-static const float BLADES_PER_ROW_INV = 1.0f / BLADES_PER_ROW;
 static const float BLADE_TO_WORLD = 2048.0f / BLADES_PER_ROW;
 
 static const float UINT_TO_FLOAT = 1.0f / 4294967296.0f;
+
+uint2 BaseGridPosition(uint2 patchPos, uint bladeIndex)
+{
+	uint patchHash = Random::iqint3(patchPos);
+	uint bladeIndexRandomiser = (patchHash >> 16) & 3u;
+	uint randomBladeIndex = bladeIndex ^ bladeIndexRandomiser;
+	return patchPos * 2u + uint2(randomBladeIndex >> 1u, randomBladeIndex & 1u);
+}
+
+float2 BaseQuadrantPosition(uint2 pos, uint3 hash)
+{
+	float2 jitter = float2(hash.xy) * UINT_TO_FLOAT;
+#if defined(FAR_LOD)
+	jitter *= 0.5f;
+#endif
+	return (float2(pos) + jitter) * BLADE_TO_WORLD;
+}
+
+static const uint WORK_HAS_LAND = 1u << 16u;
 
 struct QuadrantData
 {
@@ -66,43 +104,48 @@ struct QuadrantData
 
 cbuffer QuadrantData : register(b7)
 {
-	float4 lodFadeIn;   // x: fade-in start dist (world), y: 1/range; per-tier LOD cross-fade
-	float4 lodFadeOut;  // x: fade-out start dist (world), y: 1/range, z: min keep at the far edge
+	float4 lodFadeIn;  // x: fade-in start, y: inverse range, z: unused, w: fade-out endpoint
+	float4 lodFadeOut;
 	QuadrantData data[QUADRANT_DATA_SIZE];
 }
 
-AppendStructuredBuffer<Blade> BladeAppendBuffer : register(u0);
+RWStructuredBuffer<Blade> BladeOutput : register(u0);
+RWByteAddressBuffer IndirectArgs : register(u1);
 
-Texture2D<float> gHeightTex : register(t0);
+// Far's handoff fill stages its candidates in rounds, so its group-shared staging does not limit occupancy.
+#define FAR_STAGED_CANDIDATES 4
+#if defined(FAR_LOD) && SLOPE_EXTRA_BLADES + 1 > FAR_STAGED_CANDIDATES
+#	define PGRASS_STAGED_ROUNDS
+static const uint MAX_BLADES_PER_THREAD = FAR_STAGED_CANDIDATES;
+#else
+static const uint MAX_BLADES_PER_THREAD = 1u + (SLOPE_EXTRA_BLADES + PATCH_BLADE_COUNT - 1u) / PATCH_BLADE_COUNT;
+#endif
 
-// One 17x17 grass-type grid per quadrant. 0 is bare and 1..N selects the grass type.
-StructuredBuffer<uint> QuadrantGrass : register(t1);
+#if defined(HIGH_LOD) || defined(MID_LOD) || defined(LOW_LOD)
+// Adjacent lanes occupy adjacent slots for each emission, reducing shared-memory bank conflicts.
+groupshared Blade GroupBlades[THREADGROUP_SIZE * MAX_BLADES_PER_THREAD];
+#	if defined(PGRASS_OUTER_LIST)
+groupshared uint GroupBladeOuter[THREADGROUP_SIZE * MAX_BLADES_PER_THREAD];
+groupshared uint GroupOuterCount;
+#	endif
+groupshared uint GroupInnerCount;
+groupshared uint2 GroupOutputBase;
+#	if defined(PGRASS_STAGED_ROUNDS)
+groupshared uint GroupCandidateRounds;
+#	endif
+#endif
+
+Texture2D<float> TerrainHeightTexture : register(t0);
+SamplerState LinearSampler : register(s0);
 
 static const uint QUADRANT_GRASS_PITCH = 17;
 static const float QUADRANT_GRASS_SPACING = 2048.0f / 16.0f;
 
-SamplerState gLinearSampler : register(s0);
-
-// One 17x17 LAND height grid per quadrant. Loaded cells use these exact heights instead of the quantized heightmap.
 StructuredBuffer<float> QuadrantHeights : register(t3);
 
-// Compact blade-task list. The low 12 bits select QuadrantData and the remaining bits store the blade slot and culling flags.
-StructuredBuffer<uint> VisibleBladeTasks : register(t5);
-StructuredBuffer<uint> QuadrantGrassCells : register(t6);  // one packed 2x2 LAND-id cell per 16x16 quadrant cell
-
-static const uint WORK_QUADRANT_MASK = 0xFFFu;
-static const uint WORK_LANE_SHIFT = 12u;
-static const uint WORK_HAS_LAND = 1u << 16u;
-static const uint WORK_INSIDE_FRUSTUM = 1u << 17u;
-static const uint WORK_ALLOW_SLOPE_EXTRAS = 1u << 18u;
-
-static const float QUADRANT_NO_HEIGHT = -3.0e38f;
-
-/** @brief Returns bilinear LAND height and slope from the same four corner loads. */
+// Return bilinear LAND height and slope from the same four corners.
 bool SampleLandHeightSlope(out float height, out float2 slope, float2 quadLocalPos, uint quadrant, bool hasLand)
 {
-	uint quadrantBase = quadrant * (QUADRANT_GRASS_PITCH * QUADRANT_GRASS_PITCH);
-
 	height = 0.0f;
 	slope = float2(0.0f, 0.0f);
 
@@ -113,6 +156,7 @@ bool SampleLandHeightSlope(out float height, out float2 slope, float2 quadLocalP
 	int2 baseSample = int2(gridPosition);
 	float2 sampleFraction = gridPosition - baseSample;
 
+	uint quadrantBase = quadrant * (QUADRANT_GRASS_PITCH * QUADRANT_GRASS_PITCH);
 	uint lowerLeftIndex = quadrantBase + baseSample.y * QUADRANT_GRASS_PITCH + baseSample.x;
 	float heightLowerLeft = QuadrantHeights[lowerLeftIndex];
 	float heightLowerRight = QuadrantHeights[lowerLeftIndex + 1];
@@ -120,634 +164,300 @@ bool SampleLandHeightSlope(out float height, out float2 slope, float2 quadLocalP
 	float heightUpperRight = QuadrantHeights[lowerLeftIndex + QUADRANT_GRASS_PITCH + 1];
 
 	height = lerp(lerp(heightLowerLeft, heightLowerRight, sampleFraction.x), lerp(heightUpperLeft, heightUpperRight, sampleFraction.x), sampleFraction.y);
-	// Analytic bilinear gradient in world units.
 	slope = float2(
-		lerp(heightLowerRight - heightLowerLeft, heightUpperRight - heightUpperLeft, sampleFraction.y),
-		lerp(heightUpperLeft - heightLowerLeft, heightUpperRight - heightLowerRight, sampleFraction.x)) * (1.0f / QUADRANT_GRASS_SPACING);
+				lerp(heightLowerRight - heightLowerLeft, heightUpperRight - heightUpperLeft, sampleFraction.y),
+				lerp(heightUpperLeft - heightLowerLeft, heightUpperRight - heightLowerRight, sampleFraction.x)) *
+	        (1.0f / QUADRANT_GRASS_SPACING);
 
 	return true;
 }
 
-/** @brief Returns terrain height and slope. LAND uses cached heights and the fallback samples the heightmap. */
-float TerrainHeightSlopeAt(out float2 slope, float2 world2D, float2 quadWorldPos, uint quadrant, bool hasLand)
+// The low 12 bits select QuadrantData. The remaining bits store the blade slot and flags.
+StructuredBuffer<uint> VisibleBladeTasks : register(t5);
+// Terrain and object surfaces dispatch separate ranges of the same work list.
+cbuffer GrassWorkRange : register(b0)
 {
-	float h;
-	if (SampleLandHeightSlope(h, slope, world2D - quadWorldPos, quadrant, hasLand))
-		return h;
-
-	h = lerp(heightMapZRange.x, heightMapZRange.y, gHeightTex.SampleLevel(gLinearSampler, world2D * heightMapScale + heightMapOffset, 0));
-	float eps = QUADRANT_GRASS_SPACING;
-	float hR = lerp(heightMapZRange.x, heightMapZRange.y, gHeightTex.SampleLevel(gLinearSampler, (world2D + float2(eps, 0.0f)) * heightMapScale + heightMapOffset, 0));
-	float hU = lerp(heightMapZRange.x, heightMapZRange.y, gHeightTex.SampleLevel(gLinearSampler, (world2D + float2(0.0f, eps)) * heightMapScale + heightMapOffset, 0));
-	slope = float2(hR - h, hU - h) * (1.0f / eps);
-
-	return h;
+	uint workItemOffset;
+	float workShare;  // Share of each compact work item's patches that this dispatch generates.
 }
 
-Texture2D<float> OcclusionMaskHigh : register(t2);
-Texture2D<float> OcclusionMaskLow : register(t4);
-
-bool IsOccludedByObject(float3 worldPos)
+uint LoadBladeTask(uint taskIndex)
 {
-	float2 uv = (worldPos.xy - occlusionParams.xy) * occlusionInvExtent + 0.5f;
-
-	if (saturate(uv.x) != uv.x || saturate(uv.y) != uv.y)
-		return false;
-
-	// TopDownOcclusion pre-pads these maps. One centre gather still covers the blade's 2x2 texel footprint.
-	float2 suv = saturate(uv);
-    float4 hi = OcclusionMaskHigh.Gather(gLinearSampler, suv);
-	float highest = max(max(hi.x, hi.y), max(hi.z, hi.w));  // empty texels hold -1e30 in the MAX map
-
-	if (highest <= worldPos.z + occlusionParams.w)
-		return false;
-
-	float4 lo = OcclusionMaskLow.Gather(gLinearSampler, suv);
-	float lowest = min(min(lo.x, lo.y), min(lo.z, lo.w));   // empty texels hold +1e30 in the MIN map
-	return lowest < worldPos.z + occlusionParams.z;
+	taskIndex += workItemOffset;
+	return VisibleBladeTasks[taskIndex];
 }
 
-void ComputeClump(out uint clumpRand, out float clumpDist, out float2 clumpDir, float2 worldPos, float gridSize, float inverseGridSize)
-{
-	float2 gridPos = worldPos * inverseGridSize;
-	int2 gridCell = int2(gridPos);
+StructuredBuffer<uint> QuadrantGrassCells : register(t6);  // Packed 2x2 LAND IDs for each quadrant cell.
+StructuredBuffer<float2> TileHeightBounds : register(t11);
+StructuredBuffer<uint> OccupancyRows : register(t12);
 
-	clumpDist = 1e30;
-	clumpRand = 0;
-
-	for (int y = gridCell.y - 1; y <= gridCell.y + 1; y++) {
-		for (int x = gridCell.x - 1; x <= gridCell.x + 1; x++) {
-			uint3 hash = Random::pcg3d(uint3(asuint(x), asuint(y), 0u));
-
-			float2 jitter = float2(hash.xy) * UINT_TO_FLOAT;
-			float2 featurePos = float2(x, y) + jitter;
-
-			float2 offset = featurePos - gridPos;
-			float distanceSquared = dot(offset, offset);
-
-			if (distanceSquared < clumpDist) {
-				clumpDist = distanceSquared;
-				clumpDir = offset;
-				clumpRand = hash.z;
-			}
-		}
-	}
-
-	float invLen = rsqrt(clumpDist);
-	clumpDist = clumpDist * invLen * gridSize;
-	clumpDir *= invLen;
-}
-
-// Grass ids are packed as four bytes per uint.
-uint LoadGrassId(uint sampleIndex)
-{
-	uint packed = QuadrantGrass[sampleIndex >> 2];
-	return (packed >> ((sampleIndex & 3u) << 3u)) & 0xFFu;
-}
-
-// PGRASS_LOD_SEAM_FIX: use identical 2x2 grass-map sampling in every LOD tier.
-// This prevents the Low -> Far transition from changing a soft LTEX boundary into
-// a nearest-sample hard boundary when the same LAND quadrant changes renderer tier.
-void ComputeGrassType(out uint type, out float bareCoverage, float2 quadLocalPos, uint quadrant, float typeRandom)
-{
-	float2 grassSample = clamp(quadLocalPos / QUADRANT_GRASS_SPACING, 0.0f, QUADRANT_GRASS_PITCH - 1.001f);
-	int2 baseSample = int2(grassSample);
-	float2 frac = grassSample - float2(baseSample);
-
-	// PGrassRenderer already uploads and binds this packed 2x2 buffer for Far as well
-	// as the near tiers, so matching the sampling costs a single structured-buffer load.
-	uint packed = QuadrantGrassCells[quadrant * 256u + baseSample.y * 16u + baseSample.x];
-	uint4 ids = uint4(packed & 0xFFu, (packed >> 8u) & 0xFFu, (packed >> 16u) & 0xFFu, packed >> 24u);
-
-	float4 weights;
-	weights.x = (1 - frac.x) * (1 - frac.y);
-	weights.y = frac.x * (1 - frac.y);
-	weights.z = (1 - frac.x) * frac.y;
-	weights.w = frac.x * frac.y;
-
-	// Fade blade height as a boundary approaches bare LAND. This hides residual
-	// density differences between Low and Far without changing the LTEX decision.
-	bareCoverage = 0.0f;
-	[unroll] for (int i = 0; i < 4; ++i)
-	{
-		if (ids[i] == 0)
-			bareCoverage += weights[i];
-	}
-
-	float weightSum = 0;
-	type = ids[3];
-
-	[unroll] for (int j = 0; j < 4; ++j)
-	{
-		weightSum += weights[j];
-		if (typeRandom < weightSum) {
-			type = ids[j];
-			break;
-		}
-	}
-}
-
-/** Far has no clump displacement, so its final XY LOD decision is known before any terrain or grass-map access. */
-bool PassesEarlyFarLOD(float2 bladeWorldPos2D, bool cullsDisabled, out float lodDist)
-{
-	lodDist = -1.0f;
-#if defined(FAR_LOD)
-	if (!cullsDisabled) {
-		lodDist = length(bladeWorldPos2D - FrameBuffer::CameraPosAdjust.xy);
-		float inRamp = saturate((lodDist - lodFadeIn.x) * lodFadeIn.y);
-		float outRamp = lerp(1.0f, lodFadeOut.z, saturate((lodDist - lodFadeOut.x) * lodFadeOut.y));
-		float keep = min(inRamp, outRamp);
-		float dither = float(Random::pcg3d(uint3(asuint(bladeWorldPos2D), 0x9E3779B9u)).z) * UINT_TO_FLOAT;
-
-		return dither <= keep;
-	}
-#endif
-	return true;
-}
-
-/** @brief Returns smooth, deterministic world-space variation from four inexpensive integer hashes. */
-float CalculateWindNoise(float2 worldPosition)
-{
-	static const float WindNoiseCellSize = 512.0f;
-	float2 cellPosition = worldPosition * (1.0f / WindNoiseCellSize);
-	int2 baseCell = int2(floor(cellPosition));
-	float2 cellFraction = frac(cellPosition);
-	float2 blend = cellFraction * cellFraction * (3.0f - 2.0f * cellFraction);
-
-	float2 noiseLower = float2(
-		Random::iqint3(asuint(baseCell)),
-		Random::iqint3(asuint(baseCell + int2(1, 0)))) * UINT_TO_FLOAT;
-	float2 noiseUpper = float2(
-		Random::iqint3(asuint(baseCell + int2(0, 1))),
-		Random::iqint3(asuint(baseCell + int2(1, 1)))) * UINT_TO_FLOAT;
-	return lerp(lerp(noiseLower.x, noiseLower.y, blend.x), lerp(noiseUpper.x, noiseUpper.y, blend.x), blend.y) * 2.0f - 1.0f;
-}
-
-// Vanilla grass's gust waveform with smooth field variation and stable per-blade offsets.
-float CalculateWindDisplacement(float2 worldPosition, float timer, float speed, float bladeHeight, float windNoise, float bladePhase, float bladeStrength)
-{
-	float gustAngle = 0.4f * ((worldPosition.x + worldPosition.y) * -0.0078125f + timer) + windNoise * 0.5f + bladePhase;
-
-	float gustSin, gustCos;
-	sincos(gustAngle, gustSin, gustCos);
-
-	float gust0 = 0.2f * cos(Math::PI * gustCos);
-	float gust1 = sin(Math::PI * gustSin);
-	float gust2 = sin(Math::TAU * gustSin);
-	float gustStrength = max(0.35f, (1.0f + windNoise * 0.35f) * bladeStrength);
-
-	// Taller blades receive a stronger gust response. 150 units matches the maximum possible grass height.
-	float heightResponse = bladeHeight * lerp(0.55f, 1.20f, saturate(bladeHeight * (1.0f / 150.0f)));
-	return heightResponse * speed * gustStrength * ((gust1 + gust2) * 0.3f + gust0) * 0.5f;
-}
-
-float CalculateWindAdjustedAngle(float clumpedAngle, float2 direction, float angle, float speed, float rotationalStiffness, float scaledWidth, float bladeHeight)
-{
-	if (angle < 0.0f)
-		angle += Math::TAU;
-
-	float diff = angle - clumpedAngle;
-	if (diff > Math::PI)
-		diff -= Math::TAU;
-	else if (diff < -Math::PI)
-		diff += Math::TAU;
-
-	float2 clumpedFacing = float2(cos(clumpedAngle), sin(clumpedAngle));
-	float alignment = dot(direction, clumpedFacing) * 0.5f + 0.5f;
-	float rotationFactor = lerp(0.2f, 1.0f, alignment * 0.5f);
-	float totalRotation = rotationFactor * speed * speed * speed * 0.5f * scaledWidth * bladeHeight;
-	float reducedRotation = totalRotation * rcp(rotationalStiffness * totalRotation + 1.0f);
-	float clampedRotation = min(reducedRotation, abs(diff)) * sign(diff);
-	return clumpedAngle + clampedRotation;
-}
-
-/** Finish one base or slope-fill candidate after its terrain plane has been established. */
-void EmitBlade(
-	uint3 initialHash,
-	float2 bladeQuadPos2D,
-	float2 initialWorldPos2D,
-	float bladeWorldZ,
-	float2 terrainSlope,
-	float3 terrainNormal,
-	uint distIndex,
-	uint quadrant,
-	bool cullsDisabled,
-	bool insideFrustum,
-	float earlyFarLodDist,
-	float preCulledDist)
-{
-	uint3 hash = initialHash;
-	float2 bladeWorldPos2D = initialWorldPos2D;
-	float typeRand = float(hash.z) * UINT_TO_FLOAT;
-	float3 worldPos = float3(bladeWorldPos2D, bladeWorldZ);
-	float3 viewPos = worldPos - FrameBuffer::CameraPosAdjust.xyz;
-
-#if !defined(LOW_LOD)
-	// Cull by XY distance before the matrix and frustum path. Main provides the base candidate's known distance.
-	float dist = preCulledDist;
-	static const float4 cullDists = float4(8192.0f, 4096.0f, 2048.0f, 1024.0f);
-	float cullDist = 8192u >> distIndex;
-	if (dist < 0.0f) {
-		dist = length(viewPos.xy);
-		if (dist >= cullDist && !cullsDisabled)
-			return;
-	}
-#endif
-
-	if (!insideFrustum) {
-		static const float MAX_GRASS_HEIGHT = 150.0f;
-		float4 clip = mul(FrameBuffer::CameraViewProj, float4(viewPos, 1));
-		float extraHeight = MAX_GRASS_HEIGHT * 2.0f;
-		float padX = cameraViewRow0Sum * extraHeight;
-		float padY = cameraViewRow1Sum * extraHeight;
-		bool outsideFrustum = clip.x < -(clip.w + padX) || clip.x > clip.w + padX || clip.y < -(clip.w + padY) || clip.y > clip.w + padY;
-		if (outsideFrustum && !cullsDisabled)
-			return;
-	}
-
-	// Fetch the grass type after culling to avoid the grass-map lookup for rejected blades.
-	uint type;
-	float bareCoverage;
-
-	float2 mapSamplePos = bladeQuadPos2D + (float2(hash.xy) * UINT_TO_FLOAT * 2.0f - 1.0f) * miscParams.x;
-	ComputeGrassType(type, bareCoverage, mapSamplePos, quadrant, typeRand);
-	if (type == 0 && !cullsDisabled)
-		return;
-	type = max(type, 1u);
-
-	GrassGeneratorType grassType = generatorGrassType[type];
-	if (!cullsDisabled && (terrainNormal.z < grassType.maxSlope || terrainNormal.z > grassType.minSlope))
-		return;
-
-	// Compute clumps after culling to avoid the nine-cell search for rejected blades.
-	uint clumpRand;
-	float clumpDist;
-	float2 clumpDir;
-#if defined(FAR_LOD)
-	// Far skips invisible clump variation.
-	clumpRand = 0u;
-	clumpDist = 1.0f;  // -> clumpDensity 0
-	clumpDir = float2(0.0f, 0.0f);  // -> zero clump displacement
-#else
-	ComputeClump(clumpRand, clumpDist, clumpDir, bladeWorldPos2D, voronoiGridSize, inverseVoronoiGridSize);
-#endif
-	float clumpDensity = saturate(1.0f - clumpDist);
-
-	hash = Random::pcg3d(hash);
-	float clumpDistRand = float(hash.x) * UINT_TO_FLOAT;
-	float heightRand = float(hash.y) * UINT_TO_FLOAT;
-	float angleRand = float(hash.z) * UINT_TO_FLOAT;
-
-	// Shift toward the clump centre and keep the base on the terrain plane.
-	float2 clumpDisplace = clumpDir * clumpDist * saturate(clumpDistRand - 0.5f) * grassType.clumpDistanceFactor;
-	bladeWorldPos2D += clumpDisplace;
-#if !defined(FAR_LOD)
-	bladeWorldZ += dot(terrainSlope, clumpDisplace);
-	worldPos = float3(bladeWorldPos2D, bladeWorldZ);
-	viewPos = worldPos - FrameBuffer::CameraPosAdjust.xyz;
-#endif
-
-#if !defined(FAR_LOD)
-	if (!cullsDisabled) {
-		float lodDist = length(viewPos.xy);
-		float inRamp = saturate((lodDist - lodFadeIn.x) * lodFadeIn.y);
-		float outRamp = lerp(1.0f, lodFadeOut.z, saturate((lodDist - lodFadeOut.x) * lodFadeOut.y));
-		float keep = min(inRamp, outRamp);
-		float dither = float(Random::pcg3d(uint3(asuint(bladeWorldPos2D), 0x9E3779B9u)).z) * UINT_TO_FLOAT;
-#if defined(MID_LOD)
-		// High keeps the lower random values. Mid takes the rest during their shared transition.
-		if ((inRamp < 1.0f && dither <= 1.0f - inRamp) || dither > outRamp)
-#elif defined(HIGH_LOD)
-		if (keep <= 0.0f || dither > keep)
-#else
-		if (dither > keep)
-#endif
-			return;
-	}
-#endif
-
-	if (!cullsDisabled && IsOccludedByObject(worldPos))
-		return;
-
-	// Generate height after culling. The frustum test uses the maximum blade height.
-	float randClumpHeight = float(clumpRand) * UINT_TO_FLOAT;
-	float unscaledHeight = (0.45f + heightRand * 0.55f) - randClumpHeight * grassType.clumpHeightFactor;
-	// Keep the all-culls debug mode useful: only apply boundary shrink during normal generation.
-	if (!cullsDisabled)
-		unscaledHeight *= 1.0f - bareCoverage;
-	float randHeight = grassType.height * unscaledHeight;
-
-	// Blade width
-#if defined(LOW_LOD)
-	float unscaledWidth = 1.0f;
-	float fadeOut = 1.0f;
-#else
-	float gain = saturate((dist - cullDists[3]) * rcp((cullDists[1] - cullDists[3])));
-
-	float fadeOut = saturate((cullDist - dist) * (1.0f / 1024.0f));
-	float unscaledWidth = lerp(0.4f, 1.0f, gain);
-#endif
-
-	float widthRand = frac(heightRand * 1.618f + angleRand * 0.5f);
-	unscaledWidth *= lerp(0.6f, 1.0f, widthRand);
-	float scaledWidth = unscaledWidth * grassType.width * 2.5f;
-
-	hash = Random::pcg3d(hash);
-
-	// Base facing and clump alignment
-	float randAngle = angleRand * Math::TAU;
-
-#if defined(FAR_LOD)
-	float clumpedAngle = randAngle;  // no clump, so facing is just the blade's own random angle
-#else
-	float clumpAngle = atan2(-clumpDir.y, -clumpDir.x);
-	if (clumpAngle < 0)
-		clumpAngle += Math::TAU;
-	float delta = clumpAngle - randAngle;
-
-	if (delta < 0)
-		delta += Math::TAU;
-	else if (delta >= Math::TAU)
-		delta -= Math::TAU;
-
-	float clumpedAngle = randAngle + delta * grassType.clumpFacingFactor;
-
-	if (clumpedAngle < 0)
-		clumpedAngle += Math::TAU;
-	else if (clumpedAngle >= Math::TAU)
-		clumpedAngle -= Math::TAU;
-#endif
-
-	// Lean the blade downhill before applying wind.
-	float2 downhill = terrainNormal.xy;
-	float slopeSteepness = length(downhill);
-
-	if (miscParams.y > 0.0f && slopeSteepness > 1e-4f) {
-		float downhillAngle = atan2(downhill.y, downhill.x);
-
-		if (downhillAngle < 0.0f)
-			downhillAngle += Math::TAU;
-
-		float slopeDiff = downhillAngle - clumpedAngle;
-		if (slopeDiff > Math::PI)
-			slopeDiff -= Math::TAU;
-		else if (slopeDiff < -Math::PI)
-			slopeDiff += Math::TAU;
-
-		clumpedAngle += slopeDiff * miscParams.y * slopeSteepness;
-		if (clumpedAngle < 0.0f)
-			clumpedAngle += Math::TAU;
-		else if (clumpedAngle >= Math::TAU)
-			clumpedAngle -= Math::TAU;
-	}
-
-	// Turn toward the wind without rotating beyond it.
-	float windAdjustedAngle = CalculateWindAdjustedAngle(clumpedAngle, windDir, windAngle, windSpeed, grassType.rotationalStiffness, scaledWidth, randHeight);
-#if defined(HIGH_LOD) || defined(MID_LOD)
-	float windNoise = CalculateWindNoise(bladeWorldPos2D);
-	float bladeWindPhase = (float(hash.x) * UINT_TO_FLOAT - 0.5f) * 0.45f;
-	float bladeWindStrength = lerp(0.65f, 1.35f, float(hash.y) * UINT_TO_FLOAT);
-	float windDisplacement = CalculateWindDisplacement(bladeWorldPos2D, SharedData::Timer, windSpeed, randHeight, windNoise, bladeWindPhase, bladeWindStrength);
-	float previousWindDisplacement = CalculateWindDisplacement(bladeWorldPos2D, SharedData::Timer - miscParams.w, previousWindSpeed, randHeight, windNoise, bladeWindPhase, bladeWindStrength);
-#else
-	float windDisplacement = 0.0f;
-	float previousWindDisplacement = 0.0f;
-#endif
-
-#if !defined(FAR_LOD)
-	float facingSin, facingCos;
-	sincos(windAdjustedAngle, facingSin, facingCos);
-	float2 randFacing = float2(facingCos, facingSin);
-#endif
-
-	Blade b;
-	b.posXY = f32tof16(viewPos.x) << 16 | f32tof16(viewPos.y);
-	b.posZWidthHeight = f32tof16(viewPos.z) << 16 | (uint)(unscaledWidth * 255.0f) << 8 | (uint)(unscaledHeight * fadeOut * 255.0f);
-	// Keep the geometry hash independent of the camera-dependent view-thickening byte.
-	uint stableBladeHash = (hash.z << 12) | ((clumpRand & 15) << 8) | type;
-#if defined(MID_LOD) || (defined(LOW_LOD) && !defined(FAR_LOD))
-	// Pack view-thickening factors for both blade facings to avoid per-vertex evaluation.
-	float2 viewDirection = normalize(-viewPos.xy);
-	float viewDotNormal = saturate(dot(randFacing, viewDirection));
-	float viewDotNormal2 = viewDotNormal * viewDotNormal;
-	float viewThicken = (1.0f - viewDotNormal2 * viewDotNormal2) * smoothstep(0.0f, 0.2f, viewDotNormal);
-	float2 rotatedFacing = float2(randFacing.x * 0.8660254f - randFacing.y * 0.5f, randFacing.x * 0.5f + randFacing.y * 0.8660254f);
-
-	float rotatedViewDotNormal = saturate(dot(rotatedFacing, viewDirection));
-	float rotatedViewDotNormal2 = rotatedViewDotNormal * rotatedViewDotNormal;
-	float rotatedViewThicken = (1.0f - rotatedViewDotNormal2 * rotatedViewDotNormal2) * smoothstep(0.0f, 0.2f, rotatedViewDotNormal);
-	uint packedViewThicken = (uint)round(saturate(viewThicken) * 15.0f) | (uint)round(saturate(rotatedViewThicken) * 15.0f) << 4;
-
-	// Preserve the near blade layout while storing view thickening in the middle byte.
-	uint hashClumpAndGrassType = (hash.z & 0xFFFu) << 20 | packedViewThicken << 12 | ((clumpRand & 15) << 8) | type;
-#else
-	uint hashClumpAndGrassType = stableBladeHash;
-#endif
-
-	// Precompute tilt
-	uint2 tiltHash = Random::pcg2d(uint2(stableBladeHash, 0u));
-	float randTilt = grassType.tipWeight * (float(tiltHash.x) * UINT_TO_FLOAT * 1.4f + 0.30f);
-
-#if defined(FAR_LOD)
-	// Compute Far directions once per blade and pack them as eight-bit values.
-	float facingSin, facingCos;
-	float tiltSin, tiltCos;
-
-	sincos(windAdjustedAngle, facingSin, facingCos);
-	sincos(randTilt, tiltSin, tiltCos);
-
-	uint4 packedDirections = (uint4)round(saturate(float4(facingCos, facingSin, tiltSin, tiltCos) * 0.5f + 0.5f) * 255.0f);
-	b.facingTilt = packedDirections.x | packedDirections.y << 8 | packedDirections.z << 16 | packedDirections.w << 24;
-
-	// Store Far's widening ramp to avoid per-vertex length and square-root work.
-	float farWidthDistance = earlyFarLodDist >= 0.0f ? earlyFarLodDist : length(viewPos.xy);
-	uint farWidthByte = (uint)round(saturate((farWidthDistance - farParams.x) * farParams.y) * 255.0f);
-	b.seedAndType = farWidthByte << 24 | (hash.z & 0xFFFFu) << 8 | (type & 0xFFu);
-#else
-	float randBend = grassType.stiffness * (float(tiltHash.y) * UINT_TO_FLOAT * 1.6f + 0.25f);
-	uint packedDetailRandom = (tiltHash.x & 0xFFu) | (tiltHash.y & 0xFFu) << 8;
-	float tiltSin, tiltCos;
-	sincos(randTilt, tiltSin, tiltCos);
-	b.tipDir = f32tof16(tiltSin) << 16 | f32tof16(tiltCos);
-	b.hashClumpAndGrassType = hashClumpAndGrassType;
-
-	// Store current facing as SNORM8 and animated tip displacement as f16.
-	int2 packedFacing = (int2)round(clamp(randFacing, -1.0f, 1.0f) * 127.0f);
-	b.facingAndWind = (uint)(packedFacing.x & 0xFF) | (uint)(packedFacing.y & 0xFF) << 8 | f32tof16(windDisplacement) << 16;
-	b.previousWind = packedDetailRandom << 16 | f32tof16(previousWindDisplacement);
-	b.clumpDensity = f32tof16(randBend) << 16 | f32tof16(clumpDensity);
 #if defined(HIGH_LOD)
-	// One root-position probe sample covers the blade. Use UNIT_SH outside the detail range.
-#	if defined(SKYLIGHTING)
-	static const float DETAIL_FADE_END = 3072.0f;
-	sh2 skylightingSH = Skylighting::UNIT_SH;
-	if (mul(FrameBuffer::CameraViewProj, float4(viewPos, 1.0f)).w < DETAIL_FADE_END)
-		skylightingSH = Skylighting::Sample(viewPos, float3(0.0f, 0.0f, 1.0f));
-
-	b.skylightingSH0 = f32tof16(skylightingSH.x) << 16 | f32tof16(skylightingSH.y);
-	b.skylightingSH1 = f32tof16(skylightingSH.z) << 16 | f32tof16(skylightingSH.w);
-#	else
-	// Preserve the 32-byte High append stride when Skylighting is disabled.
-	b.skylightingSH0 = 0u;
-	b.skylightingSH1 = 0u;
-#	endif
-#endif
+Texture2D<uint> GrassDensityTexture : register(t7);
 #endif
 
-	BladeAppendBuffer.Append(b);
+Texture2D<float> GrassHiZ : register(t8);  // Shared current-frame scene-depth pyramid.
+#if defined(FAR_LOD)
+#	include "ProceduralGrass/PGrassCanopy.hlsli"
+#endif
+#if defined(LOW_LOD)
+Texture2D<float> TerrainSurfaceLift : register(t9);
+Texture2D<float> TerrainSurfaceHeight : register(t10);
+
+/** @brief Returns how far generated roots can be raised around a box reaching `reach` from `world2D`. */
+float GetTerrainLiftReach(float2 world2D, float reach)
+{
+	float2 offset = abs(world2D - grassLodOrigin);
+	return TerrainLiftMax * GetTerrainLiftBlend(max(offset.x, offset.y) + reach);
+}
+#endif
+
+static const uint WORK_QUADRANT_MASK = 0xFFFu;
+static const uint WORK_LANE_SHIFT = 12u;
+static const uint WORK_INSIDE_FRUSTUM = 1u << 17u;
+static const uint WORK_OBJECT_SURFACE = 1u << 18u;
+static const uint WORK_NEAR_COVERED = 1u << 19u;
+static const uint WORK_COMPACT_FAR = 1u << 20u;
+static const uint WORK_OCCUPIED_TILE = 1u << 21u;
+static const uint WORK_TILE_SHIFT = 22u;
+static const uint WORK_TILE_MASK = 0xFFu;
+static const uint WORK_FULL_GRASS = 1u << 30u;
+
+static const uint PATCHES_PER_ROW = BLADES_PER_ROW / 2u;
+static const uint PATCH_ROWS = (PATCHES_PER_QUADRANT + PATCHES_PER_ROW - 1u) / PATCHES_PER_ROW;
+static const uint OCCUPANCY_TILES_PER_AXIS = QUADRANT_GRASS_PITCH - 1u;
+static const uint MAX_TILE_PATCH_WIDTH = (PATCHES_PER_ROW + OCCUPANCY_TILES_PER_AXIS - 1u) / OCCUPANCY_TILES_PER_AXIS;
+
+// Start slope-fill seeds after High's four base slots to keep their positions consistent across tiers.
+static const uint SLOPE_EXTRA_SEED_BASE = 4u;
+
+uint3 ExtraCandidateHash(uint2 patchPos, uint extraIndex, uint quadrantHash)
+{
+	return Random::pcg3d(uint3(patchPos, SLOPE_EXTRA_SEED_BASE + extraIndex + quadrantHash));
 }
 
-[numthreads(TG_DIM_X, TG_DIM_Y, 1)] void main(uint3 dispatch : SV_DispatchThreadID)
+float2 ExtraCandidateQuadPos(uint2 patchPos, uint3 hash)
 {
-	uint patch = dispatch.x;
-	uint bladeTask = VisibleBladeTasks[dispatch.z];
-	uint bladeIndex = (bladeTask >> WORK_LANE_SHIFT) & 0xFu;
-	uint quadrant = bladeTask & WORK_QUADRANT_MASK;
-	bool hasLand = (bladeTask & WORK_HAS_LAND) != 0u;
-	bool insideFrustum = (bladeTask & WORK_INSIDE_FRUSTUM) != 0u;
-	bool allowSlopeExtras = (bladeTask & WORK_ALLOW_SLOPE_EXTRAS) != 0u;
+	return (float2(patchPos * 2u) + float2(hash.xy) * UINT_TO_FLOAT * 2.0f) * BLADE_TO_WORLD;
+}
 
-	if (patch >= PATCHES_PER_QUADRANT)
-		return;
+// Stable per-position dither shared by every tier's LOD fades.
+float LodDither(float2 worldPos2D)
+{
+	return float(Random::pcg3d(uint3(asuint(worldPos2D), 0x9E3779B9u)).z) * UINT_TO_FLOAT;
+}
 
-	bool cullsDisabled = debugFlags.x > 0.5f;
-	QuadrantData quadrantData = data[quadrant];
-	uint2 patchPos = uint2(patch % (BLADES_PER_ROW / 2), patch / (BLADES_PER_ROW / 2));
-	uint quadrantHash = quadrantData.quadrantHash;
-
-	// Preserve the base blade slot's position and seed.
-	uint patchHash = Random::iqint3(patchPos);
-	uint bladeIndexRandomiser = (patchHash >> 16) & 3;
-	uint randomBladeIndex = bladeIndex ^ bladeIndexRandomiser;
-	uint2 pos = patchPos * 2u + uint2(randomBladeIndex >> 1u, randomBladeIndex & 1u);
-
-	uint3 baseHash = Random::pcg3d(uint3(pos, quadrantHash));
-	float2 baseJitter = float2(baseHash.xy) * UINT_TO_FLOAT;
-#if defined(LOW_LOD)
-	baseJitter *= 0.5f;
-#endif
-
-	float2 baseQuadPos2D = (float2(pos) + baseJitter) * BLADE_TO_WORLD;
-	float2 baseWorldPos2D = baseQuadPos2D + quadrantData.quadWorldPos;
-	float baseFarLodDist;
-	bool useBasePath = PassesEarlyFarLOD(baseWorldPos2D, cullsDisabled, baseFarLodDist);
-	float basePreCulledDist = -1.0f;
-
-#if !defined(LOW_LOD)
-	if (!cullsDisabled) {
-		float2 baseViewXY = baseWorldPos2D - FrameBuffer::CameraPosAdjust.xy;
-		float baseDistSq = dot(baseViewXY, baseViewXY);
-		float baseCullDist = 8192u >> bladeIndex;
-		if (baseDistSq >= baseCullDist * baseCullDist)
-			useBasePath = false;
-		else
-			basePreCulledDist = sqrt(baseDistSq);
+// Maps a tile-local task index to its quadrant patch. Returns false outside the tile or past the last patch.
+bool ResolveTilePatch(uint bladeTask, inout uint patch)
+{
+	if ((bladeTask & WORK_OCCUPIED_TILE) != 0u) {
+		uint tile = (bladeTask >> WORK_TILE_SHIFT) & WORK_TILE_MASK;
+		uint2 tilePos = uint2(tile % OCCUPANCY_TILES_PER_AXIS, tile / OCCUPANCY_TILES_PER_AXIS);
+		uint2 patchStart = tilePos * uint2(PATCHES_PER_ROW, PATCH_ROWS) / OCCUPANCY_TILES_PER_AXIS;
+		uint2 patchEnd = (tilePos + 1u) * uint2(PATCHES_PER_ROW, PATCH_ROWS) / OCCUPANCY_TILES_PER_AXIS;
+		uint2 localPatch = uint2(patch % MAX_TILE_PATCH_WIDTH, patch / MAX_TILE_PATCH_WIDTH);
+		if (any(localPatch >= patchEnd - patchStart))
+			return false;
+		patch = (patchStart.y + localPatch.y) * PATCHES_PER_ROW + patchStart.x + localPatch.x;
 	}
-#endif
+	return patch < PATCHES_PER_QUADRANT;
+}
 
-	bool hasValidCandidate = useBasePath;
-#if SLOPE_EXTRA_BLADES > 0 && !defined(FAR_LOD)
-	// High and Mid blade slot zero owns the slope-fill candidate, which may outlive its base candidate.
-	hasValidCandidate = hasValidCandidate || bladeIndex == 0u;
-#endif
-
-#if SLOPE_EXTRA_BLADES > 0 && defined(FAR_LOD)
-	uint3 extraHashes[SLOPE_EXTRA_BLADES];
-	float2 extraQuadPositions[SLOPE_EXTRA_BLADES];
-	float extraFarLodDists[SLOPE_EXTRA_BLADES];
-	bool extraValid[SLOPE_EXTRA_BLADES];
-
-	if (allowSlopeExtras) {
-		[unroll] for (uint extraIndex = 0; extraIndex < SLOPE_EXTRA_BLADES; ++extraIndex) {
-			// Assign each extra slot to one base blade slot.
-			bool owned = (extraIndex % PATCH_BLADE_COUNT) == bladeIndex;
-			uint oldBladeIndex = PATCH_BLADE_COUNT + extraIndex;
-			uint3 extraHash = Random::pcg3d(uint3(patchPos, oldBladeIndex + quadrantHash));
-			float2 extraQuadPos = (float2(patchPos * 2u) + float2(extraHash.xy) * UINT_TO_FLOAT * 2.0f) * BLADE_TO_WORLD;
-
-			float extraFarLodDist;
-
-			bool valid = owned && PassesEarlyFarLOD(extraQuadPos + quadrantData.quadWorldPos, cullsDisabled, extraFarLodDist);
-			extraHashes[extraIndex] = extraHash;
-			extraQuadPositions[extraIndex] = extraQuadPos;
-			extraFarLodDists[extraIndex] = extraFarLodDist;
-			extraValid[extraIndex] = valid;
-			hasValidCandidate = hasValidCandidate || valid;
-		}
-	}
-#endif
-
-	if (!hasValidCandidate)
-		return;
-
-	// One bilinear terrain sample establishes the plane for this path and its extras.
-	float2 terrainSlope;
-	float baseWorldZ = TerrainHeightSlopeAt(terrainSlope, baseWorldPos2D, quadrantData.quadWorldPos, quadrant, hasLand);
-	float3 terrainNormal = normalize(float3(-terrainSlope.x, -terrainSlope.y, 1.0f));
-
-#if SLOPE_EXTRA_BLADES > 0
-	// Reject slope extras before grass typing, clumping, LOD, occlusion, wind, and packing.
-	float baseSlopeKeep = saturate(1.0f / max(terrainNormal.z, 0.05f) - 1.0f);
-	// Keep one emit path. Unrolling multiplies Low's DXBC sixfold.
-	[loop] for (uint candidateIndex = 0; candidateIndex < 1 + SLOPE_EXTRA_BLADES; ++candidateIndex) {
-		bool isBase = candidateIndex == 0;
-		uint3 candidateHash = baseHash;
-		float2 candidateQuadPos = baseQuadPos2D;
-		float2 candidateWorldPos = baseWorldPos2D;
-		float candidateWorldZ = baseWorldZ;
-		uint candidateDistIndex = bladeIndex;
-		bool candidateValid = useBasePath;
-		float candidateFarLodDist = baseFarLodDist;
-		float candidatePreCulledDist = basePreCulledDist;
-
-		if (!isBase) {
-			uint emitExtraIndex = candidateIndex - 1;
-			uint oldBladeIndex = PATCH_BLADE_COUNT + emitExtraIndex;
 #if defined(FAR_LOD)
-			if (!allowSlopeExtras)
-				continue;
-
-			candidateValid = extraValid[emitExtraIndex];
-			if (!candidateValid)
-				continue;
-
-			candidateHash = extraHashes[emitExtraIndex];
-			candidateQuadPos = extraQuadPositions[emitExtraIndex];
-			candidateWorldPos = candidateQuadPos + quadrantData.quadWorldPos;
-			candidateFarLodDist = extraFarLodDists[emitExtraIndex];
-			candidatePreCulledDist = -1.0f;
-
-			// Continue Low's slope fill into Far with a fade.
-			float slopeKeep = baseSlopeKeep * saturate((farParams.x + 4096.0f - candidateFarLodDist) * (1.0f / 4096.0f));
-			float keepRand = float(Random::pcg3d(uint3(asuint(candidateWorldPos), oldBladeIndex)).x) * UINT_TO_FLOAT;
-
-			if (!cullsDisabled && keepRand > slopeKeep)
-				continue;
-#else
-			// Resolve the slope roll from the extra seed before constructing its position.
-			if ((emitExtraIndex % PATCH_BLADE_COUNT) != bladeIndex)
-				continue;
-
-			candidateHash = Random::pcg3d(uint3(patchPos, oldBladeIndex + quadrantHash));
-			float slopeRoll = float(candidateHash.z) * UINT_TO_FLOAT;
-			if (!cullsDisabled && slopeRoll > baseSlopeKeep)
-				continue;
-
-			candidateQuadPos = (float2(patchPos * 2u) + float2(candidateHash.xy) * UINT_TO_FLOAT * 2.0f) * BLADE_TO_WORLD;
-			candidateWorldPos = candidateQuadPos + quadrantData.quadWorldPos;
-#endif
-			candidateWorldZ = baseWorldZ + dot(terrainSlope, candidateWorldPos - baseWorldPos2D);
-			candidateDistIndex = 0u;
+/**
+ * @brief Returns a keyed pseudo-random permutation of index within [0, count), for count <= 2^20.
+ * A four-round Feistel network permutes the next even power of two; indices it maps past count walk on until they land
+ * inside it, which keeps the mapping one-to-one.
+ */
+uint PermutePatchIndex(uint index, uint count, uint key, bool inverse)
+{
+	uint halfBits = (firstbithigh(max(count - 1u, 1u)) + 2u) >> 1u;
+	uint halfMask = (1u << halfBits) - 1u;
+	uint permuted = index;
+	[loop] for (uint walk = 0u; walk < 64u; ++walk)
+	{
+		uint left = permuted >> halfBits;
+		uint right = permuted & halfMask;
+		[unroll] for (uint step = 0u; step < 4u; ++step)
+		{
+			// The inverse runs the same rounds backwards, undoing each one.
+			uint round = inverse ? 3u - step : step;
+			uint kept = inverse ? left : right;
+			uint mixed = (inverse ? right : left) ^ (Random::pcg2d(uint2(kept + round * 0x9E3779B9u, key)).x & halfMask);
+			left = inverse ? mixed : kept;
+			right = inverse ? kept : mixed;
 		}
+		permuted = left << halfBits | right;
+		if (permuted < count)
+			return permuted;
+	}
+	return index;
+}
 
-		if (!candidateValid)
-			continue;
+/** @brief The patches a Far work item draws from: its occupancy tile, or the whole quadrant, and the key that orders them. */
+struct SharedPatchDomain
+{
+	uint2 patchStart;
+	uint rowLength;
+	uint patchCount;
+	uint key;
+};
 
-		EmitBlade(candidateHash, candidateQuadPos, candidateWorldPos, candidateWorldZ,
-			terrainSlope, terrainNormal, candidateDistIndex, quadrant, cullsDisabled, insideFrustum, candidateFarLodDist, candidatePreCulledDist);
+SharedPatchDomain GetSharedPatchDomain(uint bladeTask, uint quadrantHash)
+{
+	SharedPatchDomain domain;
+	domain.patchStart = 0u;
+	domain.rowLength = PATCHES_PER_ROW;
+	domain.patchCount = PATCHES_PER_QUADRANT;
+	uint tile = (bladeTask >> WORK_TILE_SHIFT) & WORK_TILE_MASK;
+	if ((bladeTask & WORK_OCCUPIED_TILE) != 0u) {
+		uint2 tilePos = uint2(tile % OCCUPANCY_TILES_PER_AXIS, tile / OCCUPANCY_TILES_PER_AXIS);
+		domain.patchStart = tilePos * uint2(PATCHES_PER_ROW, PATCH_ROWS) / OCCUPANCY_TILES_PER_AXIS;
+		uint2 patchSize = (tilePos + 1u) * uint2(PATCHES_PER_ROW, PATCH_ROWS) / OCCUPANCY_TILES_PER_AXIS - domain.patchStart;
+		domain.rowLength = patchSize.x;
+		domain.patchCount = patchSize.x * patchSize.y;
+	}
+	domain.key = quadrantHash ^ (tile * 0x85EBCA6Bu);
+	return domain;
+}
+
+/**
+ * @brief Maps a compact work item's task index to one of the workShare of its patches, spread over the tile or quadrant.
+ * A random permutation keeps the patches evenly spread without the lines a regular stride draws across the rows, and a
+ * larger share keeps every patch of a smaller one. The task index is the patch's rank in that order. Returns false past
+ * the share.
+ */
+bool ResolveSharedPatch(SharedPatchDomain domain, inout uint patch)
+{
+	if (domain.patchCount == 0u || patch >= max(1u, (uint)ceil(float(domain.patchCount) * workShare)))
+		return false;
+
+	uint local = PermutePatchIndex(patch, domain.patchCount, domain.key, false);
+	patch = (domain.patchStart.y + local / domain.rowLength) * PATCHES_PER_ROW + domain.patchStart.x + local % domain.rowLength;
+	return patch < PATCHES_PER_QUADRANT;
+}
+
+/** @brief Returns a resolved patch's rank in its work item's permutation: the task index a compact item gives it. */
+uint GetSharedPatchRank(SharedPatchDomain domain, uint patch)
+{
+	uint2 local = uint2(patch % PATCHES_PER_ROW, patch / PATCHES_PER_ROW) - domain.patchStart;
+	return PermutePatchIndex(local.y * domain.rowLength + local.x, domain.patchCount, domain.key, true);
+}
+#endif
+
+#include "ProceduralGrass/PGrassCulling.hlsli"
+
+#include "ProceduralGrass/PGrassPlacement.hlsli"
+
+// Blade construction and generation build on placement.
+#include "ProceduralGrass/PGrassBladeConstruction.hlsli"
+#include "ProceduralGrass/PGrassGeneration.hlsli"
+
+#if defined(HIGH_LOD) || defined(MID_LOD) || defined(LOW_LOD)
+// Writes the group's staged blades with one output reservation per list. Every thread of the group must call it.
+void FlushGroupBlades(uint groupIndex, uint2 emittedBladeCounts)
+{
+	if (groupIndex == 0u) {
+		GroupInnerCount = 0u;
+#	if defined(PGRASS_OUTER_LIST)
+		GroupOuterCount = 0u;
+#	endif
+		GroupOutputBase = uint2(0u, 0u);
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	uint2 threadOutputOffset = uint2(0u, 0u);
+	if (emittedBladeCounts.x != 0u)
+		InterlockedAdd(GroupInnerCount, emittedBladeCounts.x, threadOutputOffset.x);
+#	if defined(PGRASS_OUTER_LIST)
+	if (emittedBladeCounts.y != 0u)
+		InterlockedAdd(GroupOuterCount, emittedBladeCounts.y, threadOutputOffset.y);
+#	endif
+
+	GroupMemoryBarrierWithGroupSync();
+
+	if (groupIndex == 0u) {
+		if (GroupInnerCount != 0u)
+			IndirectArgs.InterlockedAdd(4u, GroupInnerCount, GroupOutputBase.x);
+#	if defined(PGRASS_OUTER_LIST)
+		if (GroupOuterCount != 0u) {
+			uint oldOuterEnd;
+			IndirectArgs.InterlockedAdd(24u, GroupOuterCount, oldOuterEnd);
+			IndirectArgs.InterlockedAdd(36u, 0u - GroupOuterCount, oldOuterEnd);
+			GroupOutputBase.y = oldOuterEnd - GroupOuterCount;
+		}
+#	endif
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+#	if defined(PGRASS_OUTER_LIST)
+	uint2 categoryOffset = 0u;
+#	endif
+	uint emittedBladeCount = emittedBladeCounts.x + emittedBladeCounts.y;
+	[loop] for (uint i = 0u; i < emittedBladeCount; ++i)
+	{
+#	if defined(PGRASS_OUTER_LIST)
+		uint outer = GroupBladeOuter[i * THREADGROUP_SIZE + groupIndex];
+		uint outputIndex;
+		if (outer != 0u)
+			outputIndex = GroupOutputBase.y + threadOutputOffset.y + categoryOffset.y++;
+		else
+			outputIndex = GroupOutputBase.x + threadOutputOffset.x + categoryOffset.x++;
+#	else
+		uint outputIndex = GroupOutputBase.x + threadOutputOffset.x + i;
+#	endif
+		BladeOutput[outputIndex] = GroupBlades[i * THREADGROUP_SIZE + groupIndex];
+	}
+}
+#endif
+
+[numthreads(TG_DIM_X, TG_DIM_Y, 1)] void main(uint3 dispatch : SV_DispatchThreadID, uint3 groupID : SV_GroupID, uint groupIndex : SV_GroupIndex) {
+	uint tileTask = LoadBladeTask(dispatch.z);
+
+	if (groupIndex == 0u) {
+		GroupTileOccluded = 0u;
+		if (grassHiZParams.w >= 1.0f && debugFlags.x <= 0.5f && (tileTask & WORK_OBJECT_SURFACE) == 0u) {
+			if ((tileTask & (WORK_OCCUPIED_TILE | WORK_HAS_LAND)) == (WORK_OCCUPIED_TILE | WORK_HAS_LAND))
+				GroupTileOccluded = IsOccupiedTileOccluded(tileTask) ? 1u : 0u;
+#if defined(FAR_LOD)
+			else if ((tileTask & WORK_HAS_LAND) != 0u)
+				GroupTileOccluded = IsFarGroupOccluded(tileTask, groupID.x) ? 1u : 0u;
+#endif
+		}
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+	if (GroupTileOccluded != 0u)
+		return;
+
+#if defined(PGRASS_STAGED_ROUNDS)
+	PatchCandidates candidates;
+	bool hasCandidates = PreparePatchCandidates(dispatch, candidates);
+
+	if (groupIndex == 0u)
+		GroupCandidateRounds = 0u;
+	GroupMemoryBarrierWithGroupSync();
+	if (hasCandidates)
+		InterlockedMax(GroupCandidateRounds, (candidates.candidateCount + FAR_STAGED_CANDIDATES - 1u) / FAR_STAGED_CANDIDATES);
+	GroupMemoryBarrierWithGroupSync();
+
+	uint candidateRounds = GroupCandidateRounds;
+	for (uint candidateRound = 0u; candidateRound < candidateRounds; ++candidateRound) {
+		uint2 emittedBladeCounts = 0u;
+		uint candidateBegin = candidateRound * FAR_STAGED_CANDIDATES;
+		if (hasCandidates)
+			EmitPatchCandidates(candidates, candidateBegin, min(candidateBegin + FAR_STAGED_CANDIDATES, candidates.candidateCount), groupIndex, emittedBladeCounts);
+		FlushGroupBlades(groupIndex, emittedBladeCounts);
+
+		// The next round resets the group's counters, so every thread must first finish reading this round's output base.
+		GroupMemoryBarrierWithGroupSync();
 	}
 #else
-	if (useBasePath)
-		EmitBlade(baseHash, baseQuadPos2D, baseWorldPos2D, baseWorldZ, terrainSlope, terrainNormal, bladeIndex, quadrant, cullsDisabled, insideFrustum, baseFarLodDist, basePreCulledDist);
+	uint2 emittedBladeCounts;
+	GenerateThreadBlades(dispatch, groupIndex, emittedBladeCounts);
+#	if defined(HIGH_LOD) || defined(MID_LOD) || defined(LOW_LOD)
+	FlushGroupBlades(groupIndex, emittedBladeCounts);
+#	endif
 #endif
 }

@@ -1,24 +1,22 @@
 #pragma once
 
 #include "Buffer.h"
+#include "PGrassCommon.h"
 
 /**
  * @brief Top-down world-height map of nearby geometry, for coverage/occlusion queries.
  *
- * Seperate render pass than engine's precipitation occlusion pass, to avoid the fixed angle and for high configuration,
- * and to cover more than view-dependent geometry.
+ * Separate from the engine's precipitation occlusion pass so the projection and resolution can be configured independently
+ * and the map can cover more than view-dependent geometry.
  */
 class TopDownOcclusion
 {
 public:
-	static TopDownOcclusion* GetSingleton()
-	{
-		static TopDownOcclusion singleton;
-		return &singleton;
-	}
-
 	void SetupResources();
 	void ClearShaderCache();
+
+	/** @brief Drops captured geometry and rendered maps after a load or scene transition. */
+	void Invalidate();
 
 	void Render();
 
@@ -35,7 +33,7 @@ public:
 	{
 		if (halfExtent != a_halfExtent) {
 			halfExtent = a_halfExtent;
-			capturedCentre = { 1.0e30f, 1.0e30f };
+			Invalidate();
 		}
 	}
 
@@ -45,21 +43,49 @@ public:
 	uint32_t GetMapDim() const { return mapDim; }
 	uint32_t GetDrawCount() const { return lastDrawCount; }
 
-	/** @brief Grid the window snaps to. Set to the coarsest consumer (density map) so both stay world-stable. */
-	void SetSnapDim(uint32_t a_snapDim) { snapDim = a_snapDim; }
-
-	float GetMinOccluderRadius() const { return minOccluderRadius; }
-	void SetMinOccluderRadius(float a_radius)
+	struct GrassSurfaceQuadrant
 	{
-		if (minOccluderRadius != a_radius) {
-			minOccluderRadius = a_radius;
-			capturedCentre = { 1.0e30f, 1.0e30f };
+		int32_t x = 0, y = 0;
+		PGrassCommon::QuadrantOccupancy rows{};
+		float minHeight = FLT_MAX;
+		float maxHeight = -FLT_MAX;
+	};
+
+	ID3D11ShaderResourceView* GetGrassSurfaceSRV() const;
+	uint64_t GetGrassSurfaceRevision() const { return capturedGeometryRevision; }
+	const GrassSurfaceQuadrant* GetGrassSurfaceQuadrant(int32_t x, int32_t y) const;
+	const auto& GetGrassSurfaceQuadrants() const { return grassSurfaceQuadrants; }
+
+	/** @brief Grid the window snaps to. Set to the coarsest consumer (density map) so both stay world-stable. */
+	void SetSnapDim(uint32_t a_snapDim)
+	{
+		if (snapDim != a_snapDim) {
+			snapDim = a_snapDim;
+			renderCacheValid = false;
 		}
 	}
 
-	void SetPaddingWorld(float a_padding) { paddingWorld = a_padding; }
+	void SetPaddingWorld(float a_padding)
+	{
+		if (paddingWorld != a_padding) {
+			paddingWorld = a_padding;
+			renderCacheValid = false;
+		}
+	}
 
 private:
+	struct alignas(16) HeightCB
+	{
+		float4 worldRow0, worldRow1, worldRow2;
+		float2 windowCentre;
+		float halfExtent;
+		float padding;
+		float4 grassSurfaceParams;  // Type, density, lower height bound, inverse height range.
+		float4 grassAlphaParams;    // Alpha threshold, material alpha, use vertex alpha, unused.
+		float4 grassUVTransform;    // UV scale XY and offset XY.
+	};
+	static_assert(sizeof(HeightCB) == 112);
+
 	struct CapturedGeometry
 	{
 		RE::NiPointer<RE::BSGeometry> geometry;
@@ -69,17 +95,49 @@ private:
 		ID3D11InputLayout* inputLayout = nullptr;
 		uint32_t indexCount = 0;
 		uint32_t stride = 0;
+		RE::BSGraphics::VertexDesc vertexDesc{};
+		bool grassSurfaceCaptured = false;
+		uint8_t grassType = 0;
+		float grassDensity = 0.0f;
+		winrt::com_ptr<ID3D11ShaderResourceView> grassAlphaTexture;
+		float4 grassAlphaParams{};
+		float4 grassUVTransform{};
+		uint8_t grassAlphaSampler = 0;
 	};
+
+	Texture2D* grassSurfaceMap = nullptr;
+	Texture2D* grassSurfaceDepth = nullptr;
+	ID3D11PixelShader* grassSurfacePS = nullptr;
+	winrt::com_ptr<ID3D11VertexShader> grassSurfaceAlphaVS;
+	winrt::com_ptr<ID3D11PixelShader> grassSurfaceAlphaPS;
+	winrt::com_ptr<ID3DBlob> grassSurfaceAlphaVSBlob;
+	std::unordered_map<uint64_t, winrt::com_ptr<ID3D11InputLayout>> grassAlphaInputLayouts;
+	std::array<winrt::com_ptr<ID3D11SamplerState>, 4> grassAlphaSamplers;
+	winrt::com_ptr<ID3D11DepthStencilState> grassSurfaceDSS;
+	std::unordered_map<uint64_t, GrassSurfaceQuadrant> grassSurfaceQuadrants;
+	bool grassSurfaceValid = false;
+	uint64_t loadedCellStamp = 0;
+
+	HeightCB MakeHeightConstants(const CapturedGeometry& entry) const;
+	void ResolveGrassSurface(CapturedGeometry& entry, bool allowGrass) const;
+	ID3D11InputLayout* GetGrassAlphaInputLayout(const RE::BSGraphics::VertexDesc& desc);
+	ID3D11SamplerState* GetGrassAlphaSampler(uint8_t mode);
+	void AddGrassSurfaceBounds(const CapturedGeometry& entry);
+	void FilterGrassSurfaceBlockers();
+	void CreateGrassSurfaceResources();
+	void RenderGrassSurfaces(ID3D11DeviceContext* context);
 
 	Texture2D* heightMapHigh = nullptr;
 	Texture2D* heightMapLow = nullptr;
-	Texture2D* heightMapTmp = nullptr;     // scratch for padding
+	Texture2D* heightMapTmp = nullptr;  // scratch for padding
 	Texture2D* heightMapLowTmp = nullptr;
 	uint32_t mapDim = 1024;
 	uint32_t snapDim = 1024;
 	float halfExtent = 4096.0f;
 	float2 windowCentre = { 0.0f, 0.0f };
-	float minOccluderRadius = 8.0f;
+
+	// Skip tiny clutter whose occlusion would not visibly remove grass.
+	static constexpr float MinOccluderRadius = 8.0f;
 	float paddingWorld = 8.0f;
 
 	ID3D11VertexShader* heightVS = nullptr;
@@ -91,16 +149,37 @@ private:
 	ConstantBuffer* heightCB = nullptr;
 	ConstantBuffer* padCB = nullptr;
 
-	void PadMaps(ID3D11DeviceContext* a_context);
+	bool PadMaps(ID3D11DeviceContext* a_context);
 
 	std::unordered_map<uint64_t, winrt::com_ptr<ID3D11InputLayout>> inputLayouts;
 	std::vector<CapturedGeometry> captured;
-	float2 capturedCentre = { 1.0e30f, 1.0e30f };
+	float2 capturedCentre = { 0.0f, 0.0f };
+	const RE::TESWorldSpace* capturedWorldspace = nullptr;
+	bool capturedGeometryValid = false;
+	uint64_t capturedGeometryRevision = 0;
 	uint32_t lastDrawCount = 0;
+
+	struct RenderCacheState
+	{
+		float2 windowCentre = { 0.0f, 0.0f };
+		float halfExtent = 0.0f;
+		float paddingWorld = 0.0f;
+		uint32_t mapDim = 0;
+		uint32_t snapDim = 0;
+		uint64_t capturedGeometryRevision = 0;
+
+		bool operator==(const RenderCacheState&) const = default;
+	};
+
+	RenderCacheState renderCacheState{};
+	bool renderCacheValid = false;
 
 	void CompileShaders();
 	void GatherGeometry();
-	void CollectFrom(RE::NiAVObject* a_object);
+	void CollectFrom(RE::NiAVObject* a_object, bool allowGrass);
+	RenderCacheState GetRenderCacheState() const;
+	bool CanReuseRenderedMaps() const;
+	void CommitRenderedMaps();
 
 	ID3D11InputLayout* GetInputLayout(const RE::BSGraphics::VertexDesc& a_desc);
 };

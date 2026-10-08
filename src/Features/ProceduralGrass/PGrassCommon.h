@@ -2,25 +2,209 @@
 
 namespace PGrassCommon
 {
+	inline constexpr uint32_t LowBladeBatchSize = 64;
+	inline constexpr uint32_t MidBladeBatchSize = 32;
+	inline constexpr uint32_t FarBladeBatchSize = 64;
+	// Far blades lay their root edge across the view, covering their full width rather than the 2/pi a random facing
+	// averages, so Far keeps this share of its candidates. Keep in sync with PGrassCommon.hlsli.
+	inline constexpr float FarViewFacingKeep = 0.63661977f;
+	// Far's largest blade height multiple as it makes up for its distance thinning; keep in sync with PGrassCommon.hlsli.
+	inline constexpr float FarMaxHeightScale = 2.0f;
+
+	// Low and Far draw blades at this multiple of High's width; keep in sync with PGrassCommon.hlsli.
+	inline constexpr float DistantWidthScale = 1.5f;
+	// Mid draws two of High's four base lanes per patch at High's width.
+	inline constexpr uint32_t MidPatchBladeCount = 2;
+	inline constexpr uint32_t GrassMaterialDetailDim = 64;
+	inline constexpr uint32_t GrassMaterialDetailVariants = 4;
+	inline constexpr float GrassMaterialDetailNormalRange = 1.25f;
+
 	/** @brief Returns the game's default landscape texture used when a LAND quadrant has no base texture. */
 	RE::TESLandTexture* GetDefaultLandTexture();
+	float GetGrassTexturePctThreshold();
+
+	inline uint32_t QuadrantSampleHash(int32_t cellX, int32_t cellY, uint32_t quadrant, uint32_t sample)
+	{
+		const auto mix = [](uint32_t hash, uint32_t value) {
+			for (uint32_t shift = 0; shift < 32; shift += 8) {
+				hash ^= (value >> shift) & 0xFFu;
+				hash *= 16777619u;
+			}
+			return hash;
+		};
+
+		uint32_t hash = 2166136261u;
+		hash = mix(hash, static_cast<uint32_t>(cellX));
+		hash = mix(hash, static_cast<uint32_t>(cellY));
+		hash = mix(hash, quadrant);
+		return mix(hash, sample);
+	}
+
+	inline bool HasWeightedGrass(const std::vector<uint8_t>& ids, const std::vector<float>& cumulative)
+	{
+		float previous = 0.0f;
+		for (size_t i = 0; i < ids.size(); ++i) {
+			if (ids[i] != 0u && cumulative[i] > previous)
+				return true;
+			previous = cumulative[i];
+		}
+		return false;
+	}
+
+	inline uint8_t SelectWeightedGrass(const std::vector<uint8_t>& ids, const std::vector<float>& cumulative, float total, uint32_t hash)
+	{
+		const float r = (hash * (1.0f / 4294967296.0f)) * total;
+		for (size_t i = 0; i < ids.size(); ++i) {
+			if (r < cumulative[i])
+				return ids[i];
+		}
+		return ids.back();
+	}
+
+	inline constexpr uint64_t GrassHashOffsetBasis = 14695981039346656037ull;
+	inline constexpr uint64_t GrassHashPrime = 1099511628211ull;
+
+	inline void GrassHashBytes(uint64_t& hash, const void* data, size_t byteCount)
+	{
+		const auto* bytes = static_cast<const uint8_t*>(data);
+		for (size_t i = 0; i < byteCount; ++i) {
+			hash ^= bytes[i];
+			hash *= GrassHashPrime;
+		}
+	}
+
+	template <class T>
+	inline void GrassHashValue(uint64_t& hash, const T& value)
+	{
+		GrassHashBytes(hash, &value, sizeof(value));
+	}
+
+	constexpr uint64_t GrassCellKey(int32_t cellX, int32_t cellY)
+	{
+		return (static_cast<uint64_t>(static_cast<uint32_t>(cellX)) << 32) |
+		       static_cast<uint32_t>(cellY);
+	}
+
+	constexpr uint64_t GrassQuadrantKey(uint32_t quadrantX, uint32_t quadrantY)
+	{
+		return (static_cast<uint64_t>(quadrantX) << 32) | quadrantY;
+	}
 
 	// A LAND quadrant carries a 17x17 grid of texture-blend samples, so 128 world units apart.
 	static constexpr uint32_t QuadrantGrassPitch = 17;
 	static constexpr uint32_t QuadrantGrassSamples = QuadrantGrassPitch * QuadrantGrassPitch;
+	static constexpr uint32_t QuadrantCellPitch = QuadrantGrassPitch - 1;
+
+	// The terrain material uses one base texture and five overlay slots.
+	static constexpr uint32_t LandscapeOverlayCount = 5;
+	using QuadrantOccupancy = std::array<uint16_t, QuadrantCellPitch>;
+
+	/** @brief Builds a 16x16 occupied-cell mask after the generator's one-sample neighbour fill. */
+	inline QuadrantOccupancy BuildQuadrantOccupancy(const uint8_t* ids)
+	{
+		QuadrantOccupancy rows{};
+		if (!ids)
+			return rows;
+
+		for (uint32_t cellY = 0; cellY < QuadrantCellPitch; ++cellY) {
+			uint16_t row = 0;
+			for (uint32_t cellX = 0; cellX < QuadrantCellPitch; ++cellX) {
+				const uint32_t minX = cellX > 0 ? cellX - 1 : 0;
+				const uint32_t minY = cellY > 0 ? cellY - 1 : 0;
+				const uint32_t maxX = std::min(cellX + 2, QuadrantGrassPitch - 1);
+				const uint32_t maxY = std::min(cellY + 2, QuadrantGrassPitch - 1);
+
+				bool occupied = false;
+				for (uint32_t y = minY; y <= maxY && !occupied; ++y)
+					for (uint32_t x = minX; x <= maxX; ++x)
+						if (ids[y * QuadrantGrassPitch + x] != 0u) {
+							occupied = true;
+							break;
+						}
+
+				if (occupied)
+					row |= static_cast<uint16_t>(1u << cellX);
+			}
+			rows[cellY] = row;
+		}
+
+		return rows;
+	}
+
+	/** @brief Returns one neighbouring grass id for a bare sample; reads use the original map so the fill cannot spread farther. */
+	inline uint8_t FindAdjacentGrassId(const uint8_t* ids, uint32_t width, uint32_t height, uint32_t x, uint32_t y, int32_t worldSampleX, int32_t worldSampleY)
+	{
+		static constexpr int8_t offsets[8][2] = {
+			{ -1, -1 }, { 0, -1 }, { 1, -1 }, { 1, 0 },
+			{ 1, 1 }, { 0, 1 }, { -1, 1 }, { -1, 0 }
+		};
+		const uint32_t first = (static_cast<uint32_t>(worldSampleX) * 73856093u ^ static_cast<uint32_t>(worldSampleY) * 19349663u) & 7u;
+
+		for (uint32_t i = 0; i < 8; ++i) {
+			const auto& offset = offsets[(first + i) & 7u];
+			const int32_t sampleX = static_cast<int32_t>(x) + offset[0];
+			const int32_t sampleY = static_cast<int32_t>(y) + offset[1];
+			if (sampleX < 0 || sampleY < 0 || sampleX >= static_cast<int32_t>(width) || sampleY >= static_cast<int32_t>(height))
+				continue;
+
+			const uint8_t id = ids[static_cast<size_t>(sampleY) * width + sampleX];
+			if (id != 0)
+				return id;
+		}
+
+		return 0;
+	}
+
+	/** @brief Fills bare samples within one LAND quadrant, without extending grass across its borders. */
+	inline std::array<uint8_t, QuadrantGrassSamples> FillQuadrantGrassIds(const uint8_t* ids, int32_t quadrantX, int32_t quadrantY)
+	{
+		std::array<uint8_t, QuadrantGrassSamples> filled{};
+		if (!ids)
+			return filled;
+
+		const int32_t worldSampleBaseX = quadrantX * static_cast<int32_t>(QuadrantCellPitch);
+		const int32_t worldSampleBaseY = quadrantY * static_cast<int32_t>(QuadrantCellPitch);
+		for (uint32_t y = 0; y < QuadrantGrassPitch; ++y) {
+			for (uint32_t x = 0; x < QuadrantGrassPitch; ++x) {
+				const uint32_t sample = y * QuadrantGrassPitch + x;
+				filled[sample] = ids[sample];
+				if (filled[sample] == 0u)
+					filled[sample] = FindAdjacentGrassId(ids, QuadrantGrassPitch, QuadrantGrassPitch, x, y,
+						worldSampleBaseX + static_cast<int32_t>(x), worldSampleBaseY + static_cast<int32_t>(y));
+			}
+		}
+		return filled;
+	}
+
+	/** @brief Unions shared LAND samples deterministically, preserving either quadrant's grass coverage. */
+	inline uint8_t MergeGrassIds(uint8_t first, uint8_t second)
+	{
+		return first == 0u ? second : (second == 0u ? first : std::min(first, second));
+	}
 
 	static constexpr int32_t HighTierQuadrantRadius = 2;
 	static constexpr int32_t MidTierQuadrantRadius = 4;  // Extend Mid this far to avoid popping when the player moves between Mid and Low tiers.
-	static constexpr int32_t LowTierQuadrantRadius = 5;  // Cover the last quadrants befor far, keeping far seperate since it covers LOD cells
+	// Mid hands off to Low over this distance. Mid's blades are fully straightened by then and rarely cover a pixel, so
+	// the band is short. Keep in sync with PGrassCommon.hlsli.
+	static constexpr float MidLowHandoffBand = 1024.0f;
+	static constexpr int32_t LowTierQuadrantRadius = 5;  // Low overlaps Far across their radial transition band.
+	static constexpr int32_t FarCellRadiusCap = 15;      // Maximum total streamed cell radius that fits in the Far quadrant buffer.
+	static constexpr int32_t LowTierStreamGuardQuadrants = 1;
+	static constexpr int32_t FarStreamGuardCells = 1;
+	static constexpr float FarUnloadFadeWidth = 2048.0f;
+
+	// Terrain lift map; mirrors PGrassCommon.hlsli. The window spans the Far radius cap on every side of the camera.
+	static constexpr int32_t TerrainLiftDim = 512;
+	static constexpr float TerrainLiftCellSize = 256.0f;
+	static constexpr uint32_t TerrainCanopyDim = 1024;
+	static constexpr int32_t TerrainCanopyQuadrants = TerrainCanopyDim / QuadrantCellPitch;
 
 	// Quadrants in an md<=r square (r in each of x and y), one per tier's renderer buffer.
 	constexpr uint32_t QuadrantSquare(int32_t r) { return static_cast<uint32_t>((2 * r + 1) * (2 * r + 1)); }
 
-	// Each tier's renderer holds a full (2r+1)^2 quadrant square.
-	// Used by QuadrantCount to sizes its cbuffer + blade buffers and the cap used for each tier (25/81/121 for radii 2/4/5).
 	static constexpr uint32_t HighTierQuadrantCap = QuadrantSquare(HighTierQuadrantRadius);
 	static constexpr uint32_t MidTierQuadrantCap = QuadrantSquare(MidTierQuadrantRadius);
-	static constexpr uint32_t LowTierQuadrantCap = QuadrantSquare(LowTierQuadrantRadius);
+	static constexpr uint32_t LowTierQuadrantCap = QuadrantSquare(LowTierQuadrantRadius + LowTierStreamGuardQuadrants);
 
 	// Set near the 4,096 dx11 cbuffer size cap to be able to fit as many far-tier quadrants as possible in a single cbuffer, to avoid multiple dispatches for far cells.
 	static constexpr uint32_t FarQuadrantCount = 4000;
@@ -31,11 +215,16 @@ namespace PGrassCommon
 		int cellY;
 		uint x;
 		uint y;
+		uint64_t cacheVersion;
+		bool nearCovered;  // a loaded near tier also renders this quadrant
 		const uint8_t* grassIds;
-		const float* heights;            // null when the LAND is unloaded
-		float2 worldPos;                 // cached lower-left world XY
-		float minHeight;                 // QuadrantNoHeight when unavailable
+		const uint16_t* occupancyRows;
+		const float* heights;  // null when the LAND is unloaded
+		float2 worldPos;       // cached lower-left world XY
+		float minHeight;       // QuadrantNoHeight when unavailable
 		float maxHeight;
+
+		bool operator==(const Quadrant&) const = default;
 	};
 
 	static constexpr float QuadrantNoHeight = -3.0e38f;
@@ -52,15 +241,14 @@ namespace PGrassCommon
 	struct alignas(16) QuadrantDataArray
 	{
 		// Per-tier LOD cross-fade bands, so a quadrant dithers in/out at tier boundaries instead of popping.
-		float4 lodFadeIn;   // x: fade-in start dist (world), y: 1/range; keep ramps 0 -> 1
-		float4 lodFadeOut;  // x: fade-out start dist (world), y: 1/range, z: min keep at/after the far edge
+		float4 lodFadeIn;  // x: fade-in start dist, y: 1/range, z: unused, w: fade-out endpoint
+		float4 lodFadeOut;
 		QuadrantData data[N];
 	};
 
 	struct alignas(16) GrassGlobals
 	{
-		float voronoiGridSize;
-		float inverseVoronoiGridSize;
+		float2 _padClumpGrid;  // Clump grid sizes are per grass type.
 		float cameraViewRow0Sum;
 		float cameraViewRow1Sum;
 		float2 dynamicResolutionInverted;
@@ -73,24 +261,42 @@ namespace PGrassCommon
 		float occlusionHalfExtent;
 		float occlusionInvExtent;  // 1 / (2 * half extent), used by the generator's top-down-map UV transform
 		float2 previousWindDir;
-		float _occlusionPadding;
-		float4 occlusionParams;  // xy: window centre in world space, z: underside clearance, w: top-height bias (world units)
+		float grassPBRLightingScale;  // TRUE_PBR's lighting scale, resolved for the active Linear Lighting mode.
+		float4 occlusionParams;       // xy: window centre in world space, z: underside clearance, w: top-height bias (world units)
 
-		float4 grassAOParams;     // x: density map dim, y: darken strength, z: blades-per-texel for full dark, w: canopy height (world units)
-		float4 grassLightParams;  // x: density AO, y: canopy sky occlusion, z: sun self-shadow, w: base canopy shading
+		float4 grassAOParams;     // x: density map dim, y: terrain darkness (0 disables), z: full-coverage encoding, w: canopy height (world units)
+		float4 grassLightParams;  // x: density AO, y: canopy sky occlusion, z: unused, w: base canopy shading
+		float4 grassFrameLight;   // xyz: resolved TRUE_PBR directional light, w: resolved grass brightness scale
 
-		float4 farParams;  // x: thin start dist (world), y: 1/(end-start), z: min keep fraction at far edge
-		float4 miscParams;  //  x: grass map edge noise in world units, y: slope facing, z: view thicken, w: timer delta
+		float4 farParams;          // x: thin start, y: inverse range, z: Far candidate spacing, w: Far performance keep
+		float4 miscParams;         // x: grass map edge noise in world units, y: object surface map enabled, z: view thicken, w: timer delta
 		float4 grassTerrainBlend;  // x: blend strength, y: blend height (world units), z: normal blend, w: roughness blend
 
-		float2 heightMapScale;      // world space -> terrain heightmap UV, pairs with heightMapOffset
-		float2 heightMapOffset;     // -pos0.xy * heightMapScale
-		float2 heightMapZRange;     // {pos0.z, pos1.z}; texels are normalised and lerp between these
+		float2 heightMapScale;   // world space -> terrain heightmap UV, pairs with heightMapOffset
+		float2 heightMapOffset;  // -pos0.xy * heightMapScale
+		float2 heightMapZRange;  // {pos0.z, pos1.z}; texels are normalised and lerp between these
 
-		float2 debugFlags;          // x: bypass every cull in the generator
+		float2 debugFlags;           // x: bypass every cull in the generator, y: colour blades by tier
 		float4 grassPresenceParams;  // xy: world min-corner of the grass-id texture, z: 1/sample spacing, w: texture dim (density gather)
+		float4 grassHiZParams;       // xy: valid base extent, z: near-tier geometry radius, w: trustworthy mip count; zero disables
+		float2 grassLodOrigin;       // camera XY with a small dead zone, preventing stationary camera sway from moving LOD bands
+		float windRotationScale;
+		uint32_t occlusionMapDim;
+		float4 frustumPlaneExtent;     // L1 extent of left, right, bottom, and top clip planes.
+		float4 grassHiZBounds;         // x: Far radius, y: near-tier clump reach, z: wind reach, w: High depth base cutoff; negative disables.
+		float4 loadedLandBounds;       // xy: world min, zw: world max of the cells with attached LAND; terrain LOD is rendered outside.
+		int32_t terrainLiftOrigin[4];  // xy: world cell at the terrain lift map's window origin, zw: last frame's origin
+		uint32_t terrainLiftPhase;     // The quarter of the terrain lift map refreshed this frame
+		float farHandoffDensityRatio;  // Low's blades per Far patch: (Low lattice density / Far lattice density)^2.
+		float pad1;
+		float pad2;
+		int32_t terrainCanopyWindow[4];  // World quadrant bounds, maximum exclusive.
+		float4 terrainCanopyParams;      // x: transition start, y: inverse range, z: maximum blade height, w: Far density falloff.
 	};
 	STATIC_ASSERT_ALIGNAS_16(GrassGlobals);
+	static_assert(offsetof(GrassGlobals, grassPBRLightingScale) == 60);
+	static_assert(offsetof(GrassGlobals, grassFrameLight) == 112);
+	static_assert(sizeof(GrassGlobals) == 368);
 
 	struct alignas(16) GrassType
 	{
@@ -109,34 +315,38 @@ namespace PGrassCommon
 		float clumpFacingFactor;
 		float clumpAOStrength;
 		float clumpColorStrength;
-
-		float spatialFreq;
-		float phaseOffset;
-		float phaseLag;
-
 		float minAO;
 		float specular;
+		float clumpLeanFactor;
 
 		float2 minMaxSubsurfaceOpacity;
-		float4 grassSurfParams;  // x: micro-detail, y: ambient normal flatten, z: wrap amount, w: anisotropic specular
+		float clumpGridSize;
+		float specularAnisotropy;         // OpenPBR specular_roughness_anisotropy, stretched across the blade
+		float4 grassSurfParams;           // x: sheen (fuzz) strength, y: thin-subsurface anisotropy + 1, z: slope facing, w: sheen roughness
 		float4 baseMinTipRoughnessStart;  // roughness at the base, at the smoothest point, and at the tip and t at which roughness bottoms out and starts climbing to the tip
-		float4 midRoughnessPolynomial;  // x: cubic, y: quadratic, z: base; matches the authored curve at Mid's t={0,.5,1}
-		float4 grassTypeLightParams;      // x: ground bounce, y: sky translucency, z: specular occlusion, w: ambient desaturation
+		float4 midRoughnessPolynomial;    // x: cubic, y: quadratic, z: base; matches the authored curve at Mid's t={0,.5,1}
+		float4 grassTypeLightParams;      // x: ground bounce, y: mean vertical height fraction, z: mean Far triangle area, w: ambient desaturation
 
 		float4 baseColor;
 		float4 tipColor;
 		float4 grassColorTipDry;
-		float4 grassColorVar;     // x: hue variation, y: brightness variation, z: tip-dry strength, w: mottle strength
+		float4 grassColorVar;  // x: hue variation, y: brightness variation, z: tip-dry strength, w: mottle strength
 		float4 grassColorCool;
 		float4 grassColorWarm;
 		float4 grassBounceColor;
-		float4 grassTextureParams;  // x: blotch strength, y: blotch scale, z: speckle strength, w: speckle scale
-		float4 grassVeinParams;     // rgb: vein albedo tint, w: vein albedo strength
-		float4 grassVeinParams2;    // x: vein normal strength, y: ripple depth, z: micro-wiggle amount
-		float4 grassSubsurfaceColor;  // rgb: subsurface/translucency tint
+		float4 grassTextureParams;           // x: blotch strength, y: blotch scale, z: speckle strength, w: speckle scale
+		float4 grassVeinParams;              // rgb: vein albedo tint, w: vein albedo strength
+		float4 grassVeinParams2;             // x: vein normal strength, y: ripple depth, z: micro-wiggle amount, w: curved normal strength
+		float4 grassSubsurfaceColor;         // rgb: linear scattering tint divided by the reference blade colour, w: sheen (fuzz) tint toward the blade hue
+		float4 fuzzDirectionalAlbedoParams;  // inverse width, centre, amplitude and offset of the MaterialX fuzz fit
 	};
 	STATIC_ASSERT_ALIGNAS_16(GrassType);
-	static_assert(sizeof(GrassType) == 320);
+
+	// HLSL cbuffer packing keeps float2 inside one 16-byte register, so these offsets must match it.
+	static_assert(offsetof(GrassType, minMaxSubsurfaceOpacity) == 64);
+	static_assert(offsetof(GrassType, grassSurfParams) == 80);
+	static_assert(offsetof(GrassType, fuzzDirectionalAlbedoParams) == 320);
+	static_assert(sizeof(GrassType) == 336);
 
 	// Slot 0 = bare, slot 1 = the base/default type, leaving 126 total slots for loaded per-texture variants.
 	static constexpr uint32_t MaxGrassTypes = 128;
@@ -145,8 +355,9 @@ namespace PGrassCommon
 	{
 		GrassType grassType[MaxGrassTypes];
 	};
+	static_assert(sizeof(GrassTypesArray) <= 65536);
 
-	// Simplfied type definition to save memory in the generator
+	// Compact type data used by blade generation.
 	struct alignas(16) GrassGeneratorType
 	{
 		float height;
@@ -156,13 +367,19 @@ namespace PGrassCommon
 		float stiffness;
 		float rotationalStiffness;
 		float tipWeight;
-		float _pad0;
+		float mid;
 		float clumpDistanceFactor;
 		float clumpHeightFactor;
 		float clumpFacingFactor;
+		float clumpLeanFactor;
+		float clumpGridSize;
+		float inverseClumpGridSize;
+		float slopeFacing;
 		float _pad1;
 	};
 	STATIC_ASSERT_ALIGNAS_16(GrassGeneratorType);
+	static_assert(sizeof(GrassGeneratorType) == 64);
+	static_assert(offsetof(GrassGeneratorType, slopeFacing) == 56);
 
 	struct GrassGeneratorTypesArray
 	{
@@ -171,31 +388,51 @@ namespace PGrassCommon
 
 	struct Blade
 	{
-		uint posXY;
-		uint posZWidthHeight;
-		uint facingAndWind;  // low 16: current facing as 2x SNORM8; high 16: current wind displacement as f16
-		uint previousWind;   // low 16: previous wind displacement as f16; high 16: two UNORM8 blade-detail randoms
+		uint posXY;            // camera-relative x/y as two f16 values
+		uint posZWidthHeight;  // camera-relative z as f16; low 16 are tier-specific geometry data
+		uint facingAndWind;    // low 16: current facing as 2x SNORM8; high 16 is tier-specific
+		uint previousWind;     // tier-specific geometry and motion data
 		uint hashClumpAndGrassType;
-		uint clumpDensity;
-		uint tipDir;  // (sin, cos) of the blade tilt as 2x f16
+		uint tipDir;  // tier-specific packed tilt and lighting or distance data
 	};
-	static_assert(sizeof(Blade) == 28);
+	static_assert(sizeof(Blade) == 24);
 
-	// Struct for high blades to store a compact, per-blade skylighting SH value (four f16 values) along with the blade's packed data.
 	struct BladeSkylit
 	{
 		Blade blade;
 		uint skylightingSH0;
 		uint skylightingSH1;
 	};
-	static_assert(sizeof(BladeSkylit) == 36);
+	static_assert(sizeof(BladeSkylit) == 32);
+
+	struct BladeMid
+	{
+		Blade blade;
+		float3 skylightingRoot;
+	};
+	static_assert(sizeof(BladeMid) == 36);
+
+	// Mid has no previous-position output.
+	struct BladeMidCollision
+	{
+		BladeMid blade;
+		uint collisionData;
+	};
+	static_assert(sizeof(BladeMidCollision) == 40);
+
+	struct BladeSkylitCollision
+	{
+		BladeSkylit blade;
+		uint collisionData[3];
+	};
+	static_assert(sizeof(BladeSkylitCollision) == 44);
 
 	struct BladeFar
 	{
-		uint posXY;
-		uint posZWidthHeight;
+		uint posXY;            // camera-relative x/y as two f16 values
+		uint posZWidthHeight;  // camera-relative z as f16; low 16 are tier-specific geometry data
 		uint facingTilt;
-		uint seedAndType;
+		uint seedAndType;  // high 4: clump density; 24-27 and 16-19: terrain normal; 20-23: bend; 8-15: clump seed; 7: object surface; low 7: type
 	};
 	static_assert(sizeof(BladeFar) == 16);
 }
