@@ -2,7 +2,11 @@ namespace GrassCollision
 {
 	Texture2D<float4> Collision : register(t100);
 
-	cbuffer GrassCollisionPerFrame : register(b5)
+#ifndef GRASS_COLLISION_CBUFFER_REGISTER
+#	define GRASS_COLLISION_CBUFFER_REGISTER b5
+#endif
+
+	cbuffer GrassCollisionPerFrame : register(GRASS_COLLISION_CBUFFER_REGISTER)
 	{
 		float2 PosOffset;   // cell origin in camera space
 		uint2 ArrayOrigin;  // xy: array origin (clipmap wrapping)
@@ -140,7 +144,7 @@ namespace GrassCollision
 		previousCollision = ComputeNormalFromHeights(previousCollisionCenter, previousCollisionX, previousCollisionY, delta) * avgPreviousAmount;
 	}
 
-	void GetDisplacedPosition(float3 worldPosition, float3 worldPositionCentre, float alpha, float maximumDistance, bool smoothRecovery, out float3 displacement, out float3 previousDisplacement)
+	void GetDisplacedPosition(float3 worldPosition, float3 worldPositionCentre, float alpha, float maximumDistance, bool smoothRecovery, float recoveryRate, out float3 displacement, out float3 previousDisplacement)
 	{
 		float nearFactor = maximumDistance > 0.0 ? saturate(1.0 - length(worldPosition.xy) / maximumDistance) : 0.0;
 		nearFactor = nearFactor * nearFactor * (3.0 - 2.0 * nearFactor);
@@ -162,8 +166,8 @@ namespace GrassCollision
 			collision.z = -abs(collision.z);
 			previousCollision.z = -abs(previousCollision.z);
 
-			displacement = collision * alpha * nearFactor * 0.75;
-			previousDisplacement = previousCollision * alpha * nearFactor * 0.75;
+			displacement = collision * alpha * nearFactor * recoveryRate;
+			previousDisplacement = previousCollision * alpha * nearFactor * recoveryRate;
 		} else {
 			displacement = 0.0;
 			previousDisplacement = 0.0;
@@ -174,14 +178,14 @@ namespace GrassCollision
 #ifdef GRASS_OPTIMIZATIONS
 	void GetDisplacedPosition(VS_INPUT input, float3 worldPosition, float3 worldPositionCentre, out float3 displacement, out float3 previousDisplacement)
 	{
-		GetDisplacedPosition(worldPosition, worldPositionCentre, saturate(input.Color.w * 10.0), 2048.0, false, displacement, previousDisplacement);
+		GetDisplacedPosition(worldPosition, worldPositionCentre, saturate(input.Color.w * 10.0), 2048.0, false, 0.75, displacement, previousDisplacement);
 	}
 #else
 	void GetDisplacedPosition(VS_INPUT input, float3 position, out float3 displacement, out float3 previousDisplacement)
 	{
 		float3 worldPosition = mul(World, float4(position.xyz, 1.0)).xyz;
 		float3 worldPositionCentre = mul(World, float4(input.InstanceData1.xyz, 1.0)).xyz;
-		GetDisplacedPosition(worldPosition, worldPositionCentre, saturate(input.Color.w * 10.0), 2048.0, false, displacement, previousDisplacement);
+		GetDisplacedPosition(worldPosition, worldPositionCentre, saturate(input.Color.w * 10.0), 2048.0, false, 0.75, displacement, previousDisplacement);
 	}
 #endif
 #endif
